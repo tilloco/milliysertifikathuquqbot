@@ -17,3 +17,6 @@ PAYMENT_INSTRUCTIONS = os.getenv(
 
 VOLUME_PATH = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ".")
 DB_PATH = os.getenv("DB_PATH", os.path.join(VOLUME_PATH, "lawquiz.db"))
+
+# One-time price for full access to ALL topics (not per-topic — a single payment unlocks everything).
+FULL_ACCESS_PRICE_UZS = int(os.getenv("FULL_ACCESS_PRICE_UZS", "12000"))

@@ -78,12 +78,34 @@ def quizzes_keyboard():
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for q in db.list_quizzes():
         kb.inline_keyboard.append([
-            InlineKeyboardButton(
-                text=f"{q['title']} — {q['price_uzs']:,} so'm",
-                callback_data=f"quiz:{q['id']}",
-            )
+            InlineKeyboardButton(text=f"📘 {q['title']}", callback_data=f"quiz:{q['id']}")
         ])
     return kb
+
+
+def main_menu_keyboard():
+    kb = quizzes_keyboard()
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🏆 Reyting", callback_data="leaderboard")])
+    return kb
+
+
+async def send_leaderboard(chat_id):
+    rows = db.get_leaderboard(limit=10)
+    if not rows:
+        await bot.send_message(chat_id, "Hozircha reytingda hech kim yo'q. Birinchi bo'ling! 🚀")
+        return
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 <b>TOP reyting</b> (pullik foydalanuvchilar orasida)\n"]
+    for i, r in enumerate(rows):
+        name = r["first_name"] or (f"@{r['username']}" if r["username"] else f"ID {r['user_id']}")
+        prefix = medals[i] if i < 3 else f"{i + 1}."
+        bonus = "  — <b>500 000 so'm bonus!</b> 🎁" if i < 3 else ""
+        lines.append(f"{prefix} {name} — {r['total_correct']}/{r['total_answered']} to'g'ri{bonus}")
+    lines.append(
+        "\nReyting eng ko'p test ishlagan va eng ko'p to'g'ri javob topgan "
+        "foydalanuvchilar bo'yicha yangilanib boradi."
+    )
+    await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
 def question_keyboard(quiz_id, q_index, options):
@@ -100,30 +122,30 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
     idx = attempt["current_index"]
     quiz = db.get_quiz(quiz_id)
 
-    # Free-trial paywall: once a non-paying user hits the free question limit, stop and ask to pay.
-    if not db.has_access(user_id, quiz_id) and idx >= quiz["free_questions"]:
+    # Free-trial paywall: once a non-paying user hits the free-question limit on ANY topic, stop and ask to pay.
+    # Access is global — a single payment unlocks every topic, not just this one.
+    if not db.has_any_confirmed_purchase(user_id) and idx >= quiz["free_questions"]:
         db.finish_attempt(attempt["id"])
-        status = db.purchase_status(user_id, quiz_id)
-        if status == "pending":
-            await bot.send_message(chat_id, "Bepul savollar tugadi! To'lovingiz hali tasdiqlanmagan. Iltimos kuting.")
+        if db.has_any_pending_purchase(user_id):
+            await bot.send_message(chat_id, "Bepul savollar tugadi! To'lovingiz hali tasdiqlanmoqda. Iltimos kuting.")
             return
-        db.request_purchase(user_id, quiz_id)
-        price = quiz["price_uzs"]
+        price = config.FULL_ACCESS_PRICE_UZS
         discount_note = ""
         if db.has_discount(user_id):
             price = int(price * 0.8)
-            discount_note = " (20% taklif chegirmasi qo'llandi!)"
+            discount_note = " (20% taklif chegirmasi qo'llandi! 🎉)"
+        db.request_purchase(user_id, quiz_id, price_uzs=price)
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ To'ladim, screenshot yubordim", callback_data=f"paid:{quiz_id}")
+            InlineKeyboardButton(text="💳 To'lash", callback_data=f"paycard:{quiz_id}")
         ]])
         await bot.send_message(
             chat_id,
-            f"Bepul {quiz['free_questions']} ta savol tugadi!\n\n"
-            f"Qolgan savollarni yechish uchun to'lov qiling:\n"
-            f"{quiz['title']}\nNarxi: {price:,} so'm{discount_note}\n\n"
-            f"{config.PAYMENT_INSTRUCTIONS}\n\n"
-            f"To'lov qilgach, screenshotni shu botga rasm qilib yuboring.",
+            f"🎯 Siz {quiz['free_questions']} ta bepul sinov savolini yakunladingiz!\n\n"
+            f"Bir martalik to'lov bilan — <b>barcha mavzulardagi cheksiz testlarga</b> "
+            f"umrbod kirish huquqiga ega bo'lasiz. DTM va milliy sertifikatga eng qulay tayyorgarlik yo'li! 🚀\n\n"
+            f"💰 Narxi: <b>{price:,} so'm</b>{discount_note}",
             reply_markup=kb,
+            parse_mode="HTML",
         )
         return
 
@@ -163,9 +185,27 @@ async def cmd_start(message: Message, command: CommandObject):
         await message.answer("Hozircha testlar mavjud emas. Tez orada qo'shiladi!")
         return
     await message.answer(
-        "Assalomu alaykum! Imtihonga tayyorlanish uchun testni tanlang:",
-        reply_markup=quizzes_keyboard(),
+        "Assalomu alaykum! 👋\n\n"
+        "Bu yerda huquq fanidan <b>cheksiz mavzulashtirilgan testlar</b> mavjud — "
+        "Konstitutsiyaviy huquq, Oila huquqi va boshqa mavzular.\n\n"
+        "Har bir mavzudan bir nechta savolni <b>bepul</b> sinab ko'rishingiz mumkin.\n\n"
+        "🏆 <b>TOP-3 reytingga chiqqan faollarga 500 000 so'm bonus</b> kartangizga o'tkaziladi! "
+        "Reyting — eng ko'p test ishlagan va eng ko'p to'g'ri javob topgan pullik foydalanuvchilar orasida aniqlanadi.\n\n"
+        "Mavzuni tanlang 👇",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="HTML",
     )
+
+
+@dp.message(Command("reyting"))
+async def cmd_reyting(message: Message):
+    await send_leaderboard(message.chat.id)
+
+
+@dp.callback_query(F.data == "leaderboard")
+async def on_leaderboard_pressed(callback: CallbackQuery):
+    await send_leaderboard(callback.message.chat.id)
+    await callback.answer()
 
 
 @dp.message(Command("taklif"))
@@ -229,9 +269,8 @@ async def on_quiz_selected(callback: CallbackQuery):
     quiz = db.get_quiz(quiz_id)
     user_id = callback.from_user.id
 
-    status = db.purchase_status(user_id, quiz_id)
-    if status == "pending" and not db.has_access(user_id, quiz_id):
-        await callback.message.answer("To'lovingiz hali tasdiqlanmagan. Iltimos kuting.")
+    if db.has_any_pending_purchase(user_id) and not db.has_any_confirmed_purchase(user_id):
+        await callback.message.answer("To'lovingiz hali tasdiqlanmoqda. Iltimos kuting.")
         await callback.answer()
         return
 
@@ -256,9 +295,12 @@ async def on_retake_pressed(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("paid:"))
-async def on_paid_pressed(callback: CallbackQuery):
-    await callback.message.answer("Rasmni (screenshotni) shu chatga yuboring — biz tekshiramiz.")
+@dp.callback_query(F.data.startswith("paycard:"))
+async def on_paycard_pressed(callback: CallbackQuery):
+    await callback.message.answer(
+        f"{config.PAYMENT_INSTRUCTIONS}\n\n"
+        f"To'lov qilgach, screenshotni shu botga rasm qilib yuboring 📸"
+    )
     await callback.answer()
 
 
@@ -275,10 +317,8 @@ async def on_payment_screenshot(message: Message):
     if config.ADMIN_ID:
         if quiz_id is not None:
             quiz = db.get_quiz(quiz_id)
-            price = quiz["price_uzs"]
-            if db.has_discount(message.from_user.id):
-                price = int(price * 0.8)
-            caption += f"\nTest: {quiz['title']}\nKutilayotgan narx: {price:,} so'm"
+            price = db.purchase_price(message.from_user.id, quiz_id) or config.FULL_ACCESS_PRICE_UZS
+            caption += f"\nMavzu: {quiz['title']}\nKutilayotgan narx: {price:,} so'm"
             kb = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"confirm:{message.from_user.id}:{quiz_id}"),
                 InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject:{message.from_user.id}:{quiz_id}"),
@@ -298,9 +338,11 @@ async def on_confirm_pressed(callback: CallbackQuery):
     _, user_id, quiz_id = callback.data.split(":")
     user_id, quiz_id = int(user_id), int(quiz_id)
     db.confirm_purchase(user_id, quiz_id)
-    quiz = db.get_quiz(quiz_id)
     await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ TASDIQLANDI")
-    await bot.send_message(user_id, f"To'lovingiz tasdiqlandi! /start bosing va \"{quiz['title']}\" ni qayta tanlang.")
+    await bot.send_message(
+        user_id,
+        "✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor. /start bosing.",
+    )
     await callback.answer("Tasdiqlandi")
 
 
@@ -362,8 +404,10 @@ async def cmd_confirm(message: Message, command: CommandObject):
     user_id, quiz_id = int(parts[0]), int(parts[1])
     db.confirm_purchase(user_id, quiz_id)
     await message.answer(f"Tasdiqlandi: user {user_id}, quiz {quiz_id}")
-    quiz = db.get_quiz(quiz_id)
-    await bot.send_message(user_id, f"To'lovingiz tasdiqlandi! /start bosing va \"{quiz['title']}\" ni qayta tanlang.")
+    await bot.send_message(
+        user_id,
+        "✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor. /start bosing.",
+    )
 
 
 @dp.message(Command("stats"))
@@ -406,7 +450,7 @@ async def cmd_addquiz(message: Message, command: CommandObject):
         return
     parts = [p.strip() for p in command.args.split("|")]
     title, description, price = parts[0], parts[1], int(parts[2])
-    free_questions = int(parts[3]) if len(parts) > 3 else 10
+    free_questions = int(parts[3]) if len(parts) > 3 else 3
     quiz_id = db.add_quiz(title, description, price, free_questions=free_questions)
     await message.answer(
         f"Test qo'shildi. ID = {quiz_id}. Bepul savollar: {free_questions} ta.\n"

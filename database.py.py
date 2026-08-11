@@ -80,6 +80,10 @@ def init_db():
         if "last_daily_date" not in ucols:
             db.execute("ALTER TABLE users ADD COLUMN last_daily_date TEXT")
 
+        pcols = [r["name"] for r in db.execute("PRAGMA table_info(purchases)").fetchall()]
+        if "price_uzs" not in pcols:
+            db.execute("ALTER TABLE purchases ADD COLUMN price_uzs INTEGER")
+
 
 # ---------- users ----------
 
@@ -179,9 +183,7 @@ def count_purchases_by_status():
 def sum_confirmed_revenue():
     with get_db() as db:
         row = db.execute(
-            "SELECT COALESCE(SUM(q.price_uzs), 0) AS total "
-            "FROM purchases p JOIN quizzes q ON p.quiz_id = q.id "
-            "WHERE p.status='confirmed'"
+            "SELECT COALESCE(SUM(price_uzs), 0) AS total FROM purchases WHERE status='confirmed'"
         ).fetchone()
         return row["total"]
 
@@ -247,12 +249,12 @@ def get_questions(quiz_id):
 
 # ---------- purchases ----------
 
-def request_purchase(user_id, quiz_id):
+def request_purchase(user_id, quiz_id, price_uzs=None):
     with get_db() as db:
         db.execute(
-            "INSERT INTO purchases (user_id, quiz_id, status) VALUES (?, ?, 'pending') "
-            "ON CONFLICT(user_id, quiz_id) DO UPDATE SET status='pending'",
-            (user_id, quiz_id),
+            "INSERT INTO purchases (user_id, quiz_id, status, price_uzs) VALUES (?, ?, 'pending', ?) "
+            "ON CONFLICT(user_id, quiz_id) DO UPDATE SET status='pending', price_uzs=excluded.price_uzs",
+            (user_id, quiz_id, price_uzs),
         )
 
 
@@ -281,6 +283,34 @@ def has_access(user_id, quiz_id):
         return row is not None
 
 
+def has_any_confirmed_purchase(user_id):
+    """Global access check: one confirmed payment (for any topic) unlocks every topic."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT 1 FROM purchases WHERE user_id=? AND status='confirmed' LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return row is not None
+
+
+def has_any_pending_purchase(user_id):
+    with get_db() as db:
+        row = db.execute(
+            "SELECT 1 FROM purchases WHERE user_id=? AND status='pending' LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return row is not None
+
+
+def purchase_price(user_id, quiz_id):
+    with get_db() as db:
+        row = db.execute(
+            "SELECT price_uzs FROM purchases WHERE user_id=? AND quiz_id=?",
+            (user_id, quiz_id),
+        ).fetchone()
+        return row["price_uzs"] if row else None
+
+
 def purchase_status(user_id, quiz_id):
     with get_db() as db:
         row = db.execute(
@@ -298,6 +328,26 @@ def get_pending_quiz_id(user_id):
             (user_id,),
         ).fetchone()
         return row["quiz_id"] if row else None
+
+
+# ---------- leaderboard ----------
+
+def get_leaderboard(limit=10):
+    """Ranking among paying users only: most questions answered, then most correct answers."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT a.user_id, u.username, u.first_name, "
+            "COALESCE(SUM(a.current_index), 0) AS total_answered, "
+            "COALESCE(SUM(a.score), 0) AS total_correct "
+            "FROM attempts a "
+            "JOIN users u ON u.telegram_id = a.user_id "
+            "WHERE a.user_id IN (SELECT DISTINCT user_id FROM purchases WHERE status='confirmed') "
+            "GROUP BY a.user_id "
+            "ORDER BY total_answered DESC, total_correct DESC "
+            "LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return rows
 
 
 # ---------- attempts ----------

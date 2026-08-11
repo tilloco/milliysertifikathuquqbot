@@ -35,13 +35,16 @@ def init_db():
             question_text TEXT NOT NULL,
             options TEXT NOT NULL,      -- JSON list, e.g. ["A) ...","B) ...","C) ...","D) ..."]
             correct_index INTEGER NOT NULL,  -- 0-based index into options
-            order_index INTEGER DEFAULT 0
+            order_index INTEGER DEFAULT 0,
+            explanation TEXT
         );
 
         CREATE TABLE IF NOT EXISTS users (
             telegram_id INTEGER PRIMARY KEY,
             username TEXT,
-            first_name TEXT
+            first_name TEXT,
+            referred_by INTEGER,
+            last_daily_date TEXT
         );
 
         CREATE TABLE IF NOT EXISTS purchases (
@@ -67,16 +70,130 @@ def init_db():
         if "free_questions" not in cols:
             db.execute("ALTER TABLE quizzes ADD COLUMN free_questions INTEGER DEFAULT 10")
 
+        qcols = [r["name"] for r in db.execute("PRAGMA table_info(questions)").fetchall()]
+        if "explanation" not in qcols:
+            db.execute("ALTER TABLE questions ADD COLUMN explanation TEXT")
+
+        ucols = [r["name"] for r in db.execute("PRAGMA table_info(users)").fetchall()]
+        if "referred_by" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
+        if "last_daily_date" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN last_daily_date TEXT")
+
 
 # ---------- users ----------
 
-def upsert_user(telegram_id, username, first_name):
+def upsert_user(telegram_id, username, first_name, referred_by=None):
     with get_db() as db:
-        db.execute(
-            "INSERT INTO users (telegram_id, username, first_name) VALUES (?, ?, ?) "
-            "ON CONFLICT(telegram_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name",
-            (telegram_id, username, first_name),
-        )
+        existing = db.execute("SELECT telegram_id FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+        if existing:
+            db.execute(
+                "UPDATE users SET username=?, first_name=? WHERE telegram_id=?",
+                (username, first_name, telegram_id),
+            )
+        else:
+            db.execute(
+                "INSERT INTO users (telegram_id, username, first_name, referred_by) VALUES (?, ?, ?, ?)",
+                (telegram_id, username, first_name, referred_by),
+            )
+
+
+def count_referrals(telegram_id):
+    with get_db() as db:
+        row = db.execute(
+            "SELECT COUNT(*) AS c FROM users WHERE referred_by=?", (telegram_id,)
+        ).fetchone()
+        return row["c"]
+
+
+def has_discount(telegram_id, threshold=3):
+    return count_referrals(telegram_id) >= threshold
+
+
+def get_last_daily_date(telegram_id):
+    with get_db() as db:
+        row = db.execute("SELECT last_daily_date FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+        return row["last_daily_date"] if row else None
+
+
+def set_last_daily_date(telegram_id, date_str):
+    with get_db() as db:
+        db.execute("UPDATE users SET last_daily_date=? WHERE telegram_id=?", (date_str, telegram_id))
+
+
+def get_random_question():
+    with get_db() as db:
+        row = db.execute("SELECT * FROM questions ORDER BY RANDOM() LIMIT 1").fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["options"] = json.loads(d["options"])
+        return d
+
+
+def get_question_by_id(question_id):
+    with get_db() as db:
+        row = db.execute("SELECT * FROM questions WHERE id=?", (question_id,)).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["options"] = json.loads(d["options"])
+        return d
+
+
+# ---------- analytics ----------
+
+def count_users():
+    with get_db() as db:
+        return db.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+
+
+def count_users_since(date_str):
+    with get_db() as db:
+        row = db.execute(
+            "SELECT COUNT(*) AS c FROM users WHERE telegram_id IN "
+            "(SELECT DISTINCT user_id FROM attempts WHERE started_at >= ?)",
+            (date_str,),
+        ).fetchone()
+        return row["c"]
+
+
+def count_attempts_started():
+    with get_db() as db:
+        return db.execute("SELECT COUNT(*) AS c FROM attempts").fetchone()["c"]
+
+
+def count_attempts_finished():
+    with get_db() as db:
+        return db.execute("SELECT COUNT(*) AS c FROM attempts WHERE finished=1").fetchone()["c"]
+
+
+def count_purchases_by_status():
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT status, COUNT(*) AS c FROM purchases GROUP BY status"
+        ).fetchall()
+        return {r["status"]: r["c"] for r in rows}
+
+
+def sum_confirmed_revenue():
+    with get_db() as db:
+        row = db.execute(
+            "SELECT COALESCE(SUM(q.price_uzs), 0) AS total "
+            "FROM purchases p JOIN quizzes q ON p.quiz_id = q.id "
+            "WHERE p.status='confirmed'"
+        ).fetchone()
+        return row["total"]
+
+
+def quiz_popularity():
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT q.title, COUNT(a.id) AS attempts "
+            "FROM quizzes q LEFT JOIN attempts a ON a.quiz_id = q.id "
+            "GROUP BY q.id ORDER BY attempts DESC"
+        ).fetchall()
+        return rows
 
 
 # ---------- quizzes ----------
@@ -106,12 +223,12 @@ def count_questions(quiz_id):
         return row["c"]
 
 
-def add_question(quiz_id, question_text, options, correct_index, order_index=0):
+def add_question(quiz_id, question_text, options, correct_index, order_index=0, explanation=None):
     with get_db() as db:
         db.execute(
-            "INSERT INTO questions (quiz_id, question_text, options, correct_index, order_index) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (quiz_id, question_text, json.dumps(options, ensure_ascii=False), correct_index, order_index),
+            "INSERT INTO questions (quiz_id, question_text, options, correct_index, order_index, explanation) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (quiz_id, question_text, json.dumps(options, ensure_ascii=False), correct_index, order_index, explanation),
         )
 
 

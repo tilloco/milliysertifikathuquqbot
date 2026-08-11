@@ -27,6 +27,7 @@ class AddQuestion(StatesGroup):
     waiting_question = State()
     waiting_options = State()
     waiting_correct = State()
+    waiting_explanation = State()
 
 
 # ---------------- helpers ----------------
@@ -65,6 +66,11 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
             await bot.send_message(chat_id, "Bepul savollar tugadi! To'lovingiz hali tasdiqlanmagan. Iltimos kuting.")
             return
         db.request_purchase(user_id, quiz_id)
+        price = quiz["price_uzs"]
+        discount_note = ""
+        if db.has_discount(user_id):
+            price = int(price * 0.8)
+            discount_note = " (20% taklif chegirmasi qo'llandi!)"
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✅ To'ladim, screenshot yubordim", callback_data=f"paid:{quiz_id}")
         ]])
@@ -72,7 +78,7 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
             chat_id,
             f"Bepul {quiz['free_questions']} ta savol tugadi!\n\n"
             f"Qolgan savollarni yechish uchun to'lov qiling:\n"
-            f"{quiz['title']}\nNarxi: {quiz['price_uzs']:,} so'm\n\n"
+            f"{quiz['title']}\nNarxi: {price:,} so'm{discount_note}\n\n"
             f"{config.PAYMENT_INSTRUCTIONS}\n\n"
             f"To'lov qilgach, screenshotni shu botga rasm qilib yuboring.",
             reply_markup=kb,
@@ -83,9 +89,13 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
         db.finish_attempt(attempt["id"])
         score = attempt["score"]
         total = len(questions)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔁 Qayta boshlash", callback_data=f"retake:{quiz_id}")
+        ]])
         await bot.send_message(
             chat_id,
             f"Test tugadi!\nNatija: {score}/{total}",
+            reply_markup=kb,
         )
         return
     q = questions[idx]
@@ -99,8 +109,13 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
 # ---------------- user commands ----------------
 
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
-    db.upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+async def cmd_start(message: Message, command: CommandObject):
+    referred_by = None
+    if command.args and command.args.strip().isdigit():
+        ref_id = int(command.args.strip())
+        if ref_id != message.from_user.id:
+            referred_by = ref_id
+    db.upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, referred_by)
     quizzes = db.list_quizzes()
     if not quizzes:
         await message.answer("Hozircha testlar mavjud emas. Tez orada qo'shiladi!")
@@ -109,6 +124,61 @@ async def cmd_start(message: Message):
         "Assalomu alaykum! Imtihonga tayyorlanish uchun testni tanlang:",
         reply_markup=quizzes_keyboard(),
     )
+
+
+@dp.message(Command("taklif"))
+async def cmd_referral(message: Message):
+    bot_info = await bot.get_me()
+    link = f"https://t.me/{bot_info.username}?start={message.from_user.id}"
+    count = db.count_referrals(message.from_user.id)
+    remaining = max(0, 3 - count)
+    if remaining == 0:
+        status = "Tabriklaymiz! Sizga 20% chegirma faollashtirildi. Keyingi to'lovda shu chegirma qo'llanadi."
+    else:
+        status = f"Sizga yana {remaining} ta do'stingiz kerak — 20% chegirma uchun."
+    await message.answer(
+        f"Do'stlaringizni taklif qiling!\n\n"
+        f"Sizning havolangiz:\n{link}\n\n"
+        f"3 ta do'stingiz botdan foydalansa, keyingi xaridingizga 20% chegirma olasiz.\n\n"
+        f"Hozirgi taklif qilganlar soni: {count}\n{status}"
+    )
+
+
+@dp.message(Command("kunlik"))
+async def cmd_daily(message: Message):
+    import datetime
+    today = datetime.date.today().isoformat()
+    last = db.get_last_daily_date(message.from_user.id)
+    if last == today:
+        await message.answer("Bugungi bepul savolingizni allaqachon oldingiz. Ertaga qayta urinib ko'ring!")
+        return
+    q = db.get_random_question()
+    if q is None:
+        await message.answer("Hozircha savollar mavjud emas.")
+        return
+    db.set_last_daily_date(message.from_user.id, today)
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for i, opt in enumerate(q["options"]):
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text=opt, callback_data=f"dans:{q['id']}:{i}")
+        ])
+    await message.answer(f"🎁 Kunlik bepul savol:\n\n{q['question_text']}", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("dans:"))
+async def on_daily_answer(callback: CallbackQuery):
+    _, q_id, chosen = callback.data.split(":")
+    q_id, chosen = int(q_id), int(chosen)
+    with_db_question = db.get_question_by_id(q_id)
+    if with_db_question is None:
+        await callback.answer()
+        return
+    correct = (chosen == with_db_question["correct_index"])
+    feedback = "✅ To'g'ri!" if correct else f"❌ Noto'g'ri. To'g'ri javob: {with_db_question['options'][with_db_question['correct_index']]}"
+    await callback.answer(feedback, show_alert=True)
+    if with_db_question.get("explanation"):
+        await callback.message.answer(f"ℹ️ Izoh: {with_db_question['explanation']}")
+    await callback.message.answer("Ertaga yana bepul savol oling! Barcha testlarni ko'rish uchun /start bosing.")
 
 
 @dp.callback_query(F.data.startswith("quiz:"))
@@ -132,6 +202,18 @@ async def on_quiz_selected(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("retake:"))
+async def on_retake_pressed(callback: CallbackQuery):
+    quiz_id = int(callback.data.split(":")[1])
+    quiz = db.get_quiz(quiz_id)
+    user_id = callback.from_user.id
+    db.start_attempt(user_id, quiz_id)
+    attempt = db.get_active_attempt(user_id, quiz_id)
+    await callback.message.answer(f"{quiz['title']} qayta boshlandi!")
+    await send_question(callback.message.chat.id, quiz_id, attempt, user_id)
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("paid:"))
 async def on_paid_pressed(callback: CallbackQuery):
     await callback.message.answer("Rasmni (screenshotni) shu chatga yuboring — biz tekshiramiz.")
@@ -151,7 +233,10 @@ async def on_payment_screenshot(message: Message):
     if config.ADMIN_ID:
         if quiz_id is not None:
             quiz = db.get_quiz(quiz_id)
-            caption += f"\nTest: {quiz['title']}"
+            price = quiz["price_uzs"]
+            if db.has_discount(message.from_user.id):
+                price = int(price * 0.8)
+            caption += f"\nTest: {quiz['title']}\nKutilayotgan narx: {price:,} so'm"
             kb = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"confirm:{message.from_user.id}:{quiz_id}"),
                 InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject:{message.from_user.id}:{quiz_id}"),
@@ -208,6 +293,9 @@ async def on_answer(callback: CallbackQuery):
     db.advance_attempt(attempt["id"], correct)
     feedback = "✅ To'g'ri!" if correct else f"❌ Noto'g'ri. To'g'ri javob: {q['options'][q['correct_index']]}"
     await callback.answer(feedback, show_alert=not correct)
+
+    if q.get("explanation"):
+        await callback.message.answer(f"ℹ️ Izoh: {q['explanation']}")
 
     updated_attempt = db.get_active_attempt(user_id, quiz_id)
     if updated_attempt is None:
@@ -352,16 +440,33 @@ async def addq_got_correct(message: Message, state: FSMContext):
         await message.answer(f"1 dan {len(options)} gacha raqam yuboring.")
         return
 
+    await state.update_data(correct_num=correct_num)
+    await state.set_state(AddQuestion.waiting_explanation)
+    await message.answer(
+        "Endi izoh yozing (nega bu javob to'g'ri — foydalanuvchi javobdan keyin ko'radi).\n"
+        "Izoh kerak bo'lmasa, - (chiziqcha) yuboring."
+    )
+
+
+@dp.message(StateFilter(AddQuestion.waiting_explanation))
+async def addq_got_explanation(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Iltimos, izoh matnini yoki - yuboring.")
+        return
+    data = await state.get_data()
+    explanation = None if message.text.strip() == "-" else message.text.strip()
+
     quiz_id = data["quiz_id"]
     order_index = db.count_questions(quiz_id)
     db.add_question(
         quiz_id=quiz_id,
         question_text=data["question_text"],
-        options=options,
-        correct_index=correct_num - 1,
+        options=data["options"],
+        correct_index=data["correct_num"] - 1,
         order_index=order_index,
+        explanation=explanation,
     )
-    await state.update_data(question_text=None, options=None)
+    await state.update_data(question_text=None, options=None, correct_num=None)
     await state.set_state(AddQuestion.waiting_question)
     total = db.count_questions(quiz_id)
     await message.answer(

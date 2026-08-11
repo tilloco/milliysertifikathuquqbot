@@ -25,7 +25,8 @@ def init_db():
             title TEXT NOT NULL,
             description TEXT,
             price_uzs INTEGER NOT NULL,
-            language TEXT DEFAULT 'uz'
+            language TEXT DEFAULT 'uz',
+            free_questions INTEGER DEFAULT 10
         );
 
         CREATE TABLE IF NOT EXISTS questions (
@@ -62,6 +63,9 @@ def init_db():
             started_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         """)
+        cols = [r["name"] for r in db.execute("PRAGMA table_info(quizzes)").fetchall()]
+        if "free_questions" not in cols:
+            db.execute("ALTER TABLE quizzes ADD COLUMN free_questions INTEGER DEFAULT 10")
 
 
 # ---------- users ----------
@@ -87,13 +91,19 @@ def get_quiz(quiz_id):
         return db.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
 
 
-def add_quiz(title, description, price_uzs, language="uz"):
+def add_quiz(title, description, price_uzs, language="uz", free_questions=10):
     with get_db() as db:
         cur = db.execute(
-            "INSERT INTO quizzes (title, description, price_uzs, language) VALUES (?, ?, ?, ?)",
-            (title, description, price_uzs, language),
+            "INSERT INTO quizzes (title, description, price_uzs, language, free_questions) VALUES (?, ?, ?, ?, ?)",
+            (title, description, price_uzs, language, free_questions),
         )
         return cur.lastrowid
+
+
+def count_questions(quiz_id):
+    with get_db() as db:
+        row = db.execute("SELECT COUNT(*) AS c FROM questions WHERE quiz_id=?", (quiz_id,)).fetchone()
+        return row["c"]
 
 
 def add_question(quiz_id, question_text, options, correct_index, order_index=0):
@@ -137,6 +147,14 @@ def confirm_purchase(user_id, quiz_id):
         )
 
 
+def reject_purchase(user_id, quiz_id):
+    with get_db() as db:
+        db.execute(
+            "UPDATE purchases SET status='rejected' WHERE user_id=? AND quiz_id=?",
+            (user_id, quiz_id),
+        )
+
+
 def has_access(user_id, quiz_id):
     with get_db() as db:
         row = db.execute(
@@ -153,6 +171,16 @@ def purchase_status(user_id, quiz_id):
             (user_id, quiz_id),
         ).fetchone()
         return row["status"] if row else None
+
+
+def get_pending_quiz_id(user_id):
+    with get_db() as db:
+        row = db.execute(
+            "SELECT quiz_id FROM purchases WHERE user_id=? AND status='pending' "
+            "ORDER BY requested_at DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return row["quiz_id"] if row else None
 
 
 # ---------- attempts ----------

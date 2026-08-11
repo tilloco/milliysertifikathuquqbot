@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject, StateFilter
@@ -28,6 +29,47 @@ class AddQuestion(StatesGroup):
     waiting_options = State()
     waiting_correct = State()
     waiting_explanation = State()
+    waiting_bulk_file = State()
+
+
+def parse_bulk_questions(text):
+    """Parse a '===' separated block of questions into a list of dicts."""
+    option_pattern = re.compile(r'^[A-D]\)\s*')
+    questions = []
+    for block in text.split("==="):
+        lines = [l.rstrip() for l in block.strip("\n").split("\n") if l.strip()]
+        if not lines:
+            continue
+        question_lines, options, explanation_lines = [], [], []
+        correct_index = None
+        mode = "question"
+        for line in lines:
+            if option_pattern.match(line):
+                mode = "options"
+                options.append(line.strip())
+            elif line.lower().startswith("javob:"):
+                letter = line.split(":", 1)[1].strip().upper()
+                if letter:
+                    correct_index = ord(letter[0]) - ord('A')
+                mode = "after_javob"
+            elif line.lower().startswith("izoh:"):
+                mode = "explanation"
+                rest = line.split(":", 1)[1].strip()
+                if rest:
+                    explanation_lines.append(rest)
+            elif mode == "question":
+                question_lines.append(line)
+            elif mode == "explanation":
+                explanation_lines.append(line)
+        if not options or correct_index is None or not question_lines:
+            continue
+        questions.append({
+            "question_text": "\n".join(question_lines).strip(),
+            "options": options,
+            "correct_index": correct_index,
+            "explanation": "\n".join(explanation_lines).strip() or None,
+        })
+    return questions
 
 
 # ---------------- helpers ----------------
@@ -324,6 +366,36 @@ async def cmd_confirm(message: Message, command: CommandObject):
     await bot.send_message(user_id, f"To'lovingiz tasdiqlandi! /start bosing va \"{quiz['title']}\" ni qayta tanlang.")
 
 
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    total_users = db.count_users()
+    started = db.count_attempts_started()
+    finished = db.count_attempts_finished()
+    by_status = db.count_purchases_by_status()
+    revenue = db.sum_confirmed_revenue()
+    popularity = db.quiz_popularity()
+
+    lines = [
+        f"👥 Jami /start bosgan foydalanuvchilar: {total_users}",
+        f"📝 Boshlangan testlar: {started}",
+        f"✅ Tugatilgan testlar: {finished}",
+        "",
+        f"💰 To'lovlar:",
+        f"   Tasdiqlangan: {by_status.get('confirmed', 0)}",
+        f"   Kutilmoqda: {by_status.get('pending', 0)}",
+        f"   Rad etilgan: {by_status.get('rejected', 0)}",
+        f"   Jami tushum: {revenue:,} so'm",
+        "",
+        "📊 Testlar bo'yicha qiziqish:",
+    ]
+    for row in popularity:
+        lines.append(f"   {row['title']}: {row['attempts']} marta boshlangan")
+
+    await message.answer("\n".join(lines))
+
+
 @dp.message(Command("addquiz"))
 async def cmd_addquiz(message: Message, command: CommandObject):
     # Admin helper: /addquiz Title | description | price | free_questions(optional, default 10)
@@ -358,6 +430,81 @@ async def cmd_listquizzes(message: Message):
 
 
 # ---------------- admin: add question conversation ----------------
+
+@dp.message(Command("bulkadd"))
+async def cmd_bulkadd(message: Message, command: CommandObject, state: FSMContext):
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    if not command.args or not command.args.strip().isdigit():
+        await message.answer("Foydalanish: /bulkadd <test_id>\n\nMasalan: /bulkadd 1")
+        return
+    quiz_id = int(command.args.strip())
+    quiz = db.get_quiz(quiz_id)
+    if quiz is None:
+        await message.answer("Bunday ID li test topilmadi. /listquizzes orqali tekshiring.")
+        return
+    await state.update_data(quiz_id=quiz_id)
+    await state.set_state(AddQuestion.waiting_bulk_file)
+    await message.answer(
+        f"\"{quiz['title']}\" uchun .txt fayl yuboring. Format:\n\n"
+        "Savol matni?\n"
+        "A) Variant 1\n"
+        "B) Variant 2\n"
+        "C) Variant 3\n"
+        "D) Variant 4\n"
+        "Javob: B\n"
+        "Izoh: ixtiyoriy izoh\n"
+        "===\n"
+        "(keyingi savol shu tartibda, har biri === bilan ajratilgan)"
+    )
+
+
+@dp.message(StateFilter(AddQuestion.waiting_bulk_file), F.document)
+async def addq_got_bulk_file(message: Message, state: FSMContext):
+    data = await state.get_data()
+    quiz_id = data["quiz_id"]
+    file = await bot.get_file(message.document.file_id)
+    file_bytes = await bot.download_file(file.file_path)
+    try:
+        text = file_bytes.read().decode("utf-8")
+    except UnicodeDecodeError:
+        await message.answer("Faylni o'qib bo'lmadi. Fayl UTF-8 formatida .txt bo'lishi kerak.")
+        return
+
+    parsed = parse_bulk_questions(text)
+    if not parsed:
+        await message.answer(
+            "Hech qanday savol topilmadi. Formatni tekshiring va qaytadan yuboring, "
+            "yoki /done deb tugating."
+        )
+        return
+
+    start_index = db.count_questions(quiz_id)
+    for i, q in enumerate(parsed):
+        db.add_question(
+            quiz_id=quiz_id,
+            question_text=q["question_text"],
+            options=q["options"],
+            correct_index=q["correct_index"],
+            order_index=start_index + i,
+            explanation=q["explanation"],
+        )
+    total = db.count_questions(quiz_id)
+    await state.clear()
+    await message.answer(
+        f"✅ {len(parsed)} ta savol qo'shildi! (Jami: {total} ta)\n\n"
+        f"Yana fayl qo'shish uchun /bulkadd {quiz_id} deb qayta yozing."
+    )
+
+
+@dp.message(StateFilter(AddQuestion.waiting_bulk_file))
+async def addq_bulk_wrong_type(message: Message, state: FSMContext):
+    if message.text and message.text.strip().lower() == "/done":
+        await state.clear()
+        await message.answer("Fayl yuklash bekor qilindi.")
+        return
+    await message.answer("Iltimos, .txt faylni hujjat (document) sifatida yuboring.")
+
 
 @dp.message(Command("addquestion"))
 async def cmd_addquestion(message: Message, command: CommandObject, state: FSMContext):

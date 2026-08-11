@@ -15,4 +15,5 @@ PAYMENT_INSTRUCTIONS = os.getenv(
     "To'lovdan so'ng screenshot yuboring, biz tasdiqlaymiz."
 )
 
-DB_PATH = os.getenv("DB_PATH", "lawquiz.db")
+VOLUME_PATH = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ".")
+DB_PATH = os.getenv("DB_PATH", os.path.join(VOLUME_PATH, "lawquiz.db"))

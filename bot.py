@@ -125,10 +125,15 @@ def topics_keyboard():
     return kb
 
 
-def modules_keyboard(quiz_id, total_modules, completed):
+def modules_keyboard(quiz_id, total_modules, completed, quiz=None, paid=True):
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for m in range(1, total_modules + 1):
-        mark = " ✅" if m in completed else ""
+        if m in completed:
+            mark = " ✅"
+        elif quiz is not None and not paid and not module_is_free(quiz, m):
+            mark = " 🔒"
+        else:
+            mark = ""
         kb.inline_keyboard.append([
             InlineKeyboardButton(text=f"Test {m}{mark}", callback_data=f"module:{quiz_id}:{m}")
         ])
@@ -194,6 +199,36 @@ def question_keyboard(quiz_id, q_index, options):
     return kb
 
 
+def module_is_free(quiz, module_number):
+    """A whole module (Test N) is either fully free or fully paid - no mid-module cutoff."""
+    module_start = (module_number - 1) * MODULE_SIZE
+    return module_start < quiz["free_questions"]
+
+
+async def send_paywall_prompt(chat_id, quiz, user_id):
+    if db.has_any_pending_purchase(user_id):
+        await bot.send_message(chat_id, "Bepul sinov tugadi! To'lovingiz hali tasdiqlanmoqda. Iltimos kuting.")
+        return
+    price = config.FULL_ACCESS_PRICE_UZS
+    discount_note = ""
+    if db.has_discount(user_id):
+        price = int(price * 0.8)
+        discount_note = " (20% taklif chegirmasi qo'llandi! 🎉)"
+    db.request_purchase(user_id, quiz["id"], price_uzs=price)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💳 To'lash", callback_data=f"paycard:{quiz['id']}")
+    ]])
+    await bot.send_message(
+        chat_id,
+        f"🎯 Siz bepul sinov savollarini yakunladingiz!\n\n"
+        f"Bir martalik to'lov bilan — <b>barcha mavzulardagi cheksiz testlarga</b> "
+        f"umrbod kirish huquqiga ega bo'lasiz. DTM va milliy sertifikatga eng qulay tayyorgarlik yo'li! 🚀\n\n"
+        f"💰 Narxi: <b>{price:,} so'm</b>{discount_note}",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+
+
 async def send_question(chat_id, quiz_id, attempt, user_id):
     questions = db.get_questions(quiz_id)
     idx = attempt["current_index"]
@@ -202,45 +237,27 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
     module_start = (module_number - 1) * MODULE_SIZE
     module_end = min(module_start + MODULE_SIZE, len(questions))
 
-    # Free-trial paywall: once a non-paying user hits the free-question limit on ANY topic, stop and ask to pay.
-    # Access is global — a single payment unlocks every topic, not just this one.
-    if not db.has_any_confirmed_purchase(user_id) and idx >= quiz["free_questions"]:
-        db.finish_attempt(attempt["id"])
-        if db.has_any_pending_purchase(user_id):
-            await bot.send_message(chat_id, "Bepul savollar tugadi! To'lovingiz hali tasdiqlanmoqda. Iltimos kuting.")
-            return
-        price = config.FULL_ACCESS_PRICE_UZS
-        discount_note = ""
-        if db.has_discount(user_id):
-            price = int(price * 0.8)
-            discount_note = " (20% taklif chegirmasi qo'llandi! 🎉)"
-        db.request_purchase(user_id, quiz_id, price_uzs=price)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="💳 To'lash", callback_data=f"paycard:{quiz_id}")
-        ]])
-        await bot.send_message(
-            chat_id,
-            f"🎯 Siz {quiz['free_questions']} ta bepul sinov savolini yakunladingiz!\n\n"
-            f"Bir martalik to'lov bilan — <b>barcha mavzulardagi cheksiz testlarga</b> "
-            f"umrbod kirish huquqiga ega bo'lasiz. DTM va milliy sertifikatga eng qulay tayyorgarlik yo'li! 🚀\n\n"
-            f"💰 Narxi: <b>{price:,} so'm</b>{discount_note}",
-            reply_markup=kb,
-            parse_mode="HTML",
-        )
-        return
-
     if idx >= module_end:
         db.finish_attempt(attempt["id"])
         score = attempt["score"]
         total = module_end - module_start
         total_modules = db.count_modules(quiz_id)
-        has_next = module_number < total_modules
-        kb = module_result_keyboard(quiz_id, module_number, attempt["id"], has_next)
+        next_module = module_number + 1
+        has_next_module = next_module <= total_modules
+        paid = db.has_any_confirmed_purchase(user_id)
+        next_is_free = module_is_free(quiz, next_module)
+        can_continue = has_next_module and (paid or next_is_free)
+
+        kb = module_result_keyboard(quiz_id, module_number, attempt["id"], can_continue)
         await bot.send_message(
             chat_id,
             f"Test {module_number} tugadi!\nNatija: {score}/{total}",
             reply_markup=kb,
         )
+
+        # Next module exists but is locked behind payment - show the paywall right under the result.
+        if has_next_module and not paid and not next_is_free:
+            await send_paywall_prompt(chat_id, quiz, user_id)
         return
 
     q = questions[idx]
@@ -411,9 +428,10 @@ async def on_topic_selected(callback: CallbackQuery):
         return
 
     completed = db.get_completed_modules(user_id, quiz_id)
+    paid = db.has_any_confirmed_purchase(user_id)
     await callback.message.answer(
         f"{quiz['title']} — testni tanlang 👇",
-        reply_markup=modules_keyboard(quiz_id, total_modules, completed),
+        reply_markup=modules_keyboard(quiz_id, total_modules, completed, quiz=quiz, paid=paid),
     )
     await callback.answer()
 
@@ -427,6 +445,11 @@ async def on_module_selected(callback: CallbackQuery):
 
     if db.has_any_pending_purchase(user_id) and not db.has_any_confirmed_purchase(user_id):
         await callback.message.answer("To'lovingiz hali tasdiqlanmoqda. Iltimos kuting.")
+        await callback.answer()
+        return
+
+    if not db.has_any_confirmed_purchase(user_id) and not module_is_free(quiz, module_number):
+        await send_paywall_prompt(callback.message.chat.id, quiz, user_id)
         await callback.answer()
         return
 
@@ -544,7 +567,15 @@ async def on_answer(callback: CallbackQuery):
     await callback.answer(feedback, show_alert=not correct)
 
     if q.get("explanation"):
-        await callback.message.answer(f"ℹ️ Izoh: {q['explanation']}")
+        module_start = (attempt["module_number"] - 1) * MODULE_SIZE
+        q_number = q_index - module_start + 1
+        mark = "✅" if correct else "❌"
+        await callback.message.answer(
+            f"🟢 <b>{mark} {q_number}-savol izohi</b> 🟢\n"
+            f"<blockquote>{q['explanation']}</blockquote>\n"
+            f"<i>— — — — — — — — — —</i>",
+            parse_mode="HTML",
+        )
 
     updated_attempt = db.get_active_attempt(user_id, quiz_id)
     if updated_attempt is None:

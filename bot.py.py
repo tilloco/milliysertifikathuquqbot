@@ -9,6 +9,8 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -21,6 +23,12 @@ logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+MODULE_SIZE = 10
+
+BTN_TESTLAR = "📝 Testlar"
+BTN_REYTING = "🏆 Reyting"
+BTN_TARIX = "🕐 Tarix"
 
 
 class AddQuestion(StatesGroup):
@@ -74,37 +82,82 @@ def parse_bulk_questions(text):
 
 # ---------------- helpers ----------------
 
-def quizzes_keyboard():
+def main_reply_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_TESTLAR), KeyboardButton(text=BTN_REYTING)],
+            [KeyboardButton(text=BTN_TARIX)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def topics_keyboard():
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for q in db.list_quizzes():
         kb.inline_keyboard.append([
-            InlineKeyboardButton(text=f"📘 {q['title']}", callback_data=f"quiz:{q['id']}")
+            InlineKeyboardButton(text=f"📘 {q['title']}", callback_data=f"topic:{q['id']}")
         ])
     return kb
 
 
-def main_menu_keyboard():
-    kb = quizzes_keyboard()
-    kb.inline_keyboard.append([InlineKeyboardButton(text="🏆 Reyting", callback_data="leaderboard")])
+def modules_keyboard(quiz_id, total_modules, completed):
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for m in range(1, total_modules + 1):
+        mark = " ✅" if m in completed else ""
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text=f"Test {m}{mark}", callback_data=f"module:{quiz_id}:{m}")
+        ])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="📚 Mavzular", callback_data="topics")])
     return kb
+
+
+def module_result_keyboard(quiz_id, module_number, attempt_id, has_next):
+    buttons = [[InlineKeyboardButton(text="📊 Tahlil", callback_data=f"tahlil:{attempt_id}")]]
+    if has_next:
+        buttons.append([InlineKeyboardButton(
+            text="➡️ Keyingi test", callback_data=f"module:{quiz_id}:{module_number + 1}"
+        )])
+    buttons.append([InlineKeyboardButton(text="📚 Mavzular", callback_data="topics")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+MONTHLY_BONUS_UZS = [150_000, 125_000, 100_000]
 
 
 async def send_leaderboard(chat_id):
     rows = db.get_leaderboard(limit=10)
     if not rows:
-        await bot.send_message(chat_id, "Hozircha reytingda hech kim yo'q. Birinchi bo'ling! 🚀")
+        await bot.send_message(chat_id, "Hozircha bu oy reytingda hech kim yo'q. Birinchi bo'ling! 🚀")
         return
     medals = ["🥇", "🥈", "🥉"]
-    lines = ["🏆 <b>TOP reyting</b> (pullik foydalanuvchilar orasida)\n"]
+    lines = ["🏆 <b>Shu oylik TOP reyting</b> (pullik foydalanuvchilar orasida)\n"]
     for i, r in enumerate(rows):
         name = r["first_name"] or (f"@{r['username']}" if r["username"] else f"ID {r['user_id']}")
         prefix = medals[i] if i < 3 else f"{i + 1}."
-        bonus = "  — <b>500 000 so'm bonus!</b> 🎁" if i < 3 else ""
+        bonus = f"  — <b>{MONTHLY_BONUS_UZS[i]:,} so'm bonus!</b> 🎁" if i < 3 else ""
         lines.append(f"{prefix} {name} — {r['total_correct']}/{r['total_answered']} to'g'ri{bonus}")
     lines.append(
-        "\nReyting eng ko'p test ishlagan va eng ko'p to'g'ri javob topgan "
-        "foydalanuvchilar bo'yicha yangilanib boradi."
+        "\nOy oxirida TOP-3 aniqlanadi: 1-o'rin 150 000, 2-o'rin 125 000, "
+        "3-o'rin 100 000 so'm bonus oladi. Yangi oy — yangi reyting!"
     )
+    await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+
+
+async def send_history(chat_id, user_id):
+    quizzes = db.list_quizzes()
+    if not quizzes:
+        await bot.send_message(chat_id, "Hozircha testlar mavjud emas.")
+        return
+    lines = ["🕐 <b>Sizning tarixingiz</b>\n"]
+    total_done, total_all = 0, 0
+    for q in quizzes:
+        total_modules = db.count_modules(q["id"])
+        completed = db.get_completed_modules(user_id, q["id"])
+        total_done += len(completed)
+        total_all += total_modules
+        lines.append(f"{q['title']}: {len(completed)}/{total_modules} test ishlangan")
+    lines.append(f"\nJami: {total_done}/{total_all} test yakunlangan")
     await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
@@ -121,6 +174,9 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
     questions = db.get_questions(quiz_id)
     idx = attempt["current_index"]
     quiz = db.get_quiz(quiz_id)
+    module_number = attempt["module_number"]
+    module_start = (module_number - 1) * MODULE_SIZE
+    module_end = min(module_start + MODULE_SIZE, len(questions))
 
     # Free-trial paywall: once a non-paying user hits the free-question limit on ANY topic, stop and ask to pay.
     # Access is global — a single payment unlocks every topic, not just this one.
@@ -149,23 +205,24 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
         )
         return
 
-    if idx >= len(questions):
+    if idx >= module_end:
         db.finish_attempt(attempt["id"])
         score = attempt["score"]
-        total = len(questions)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🔁 Qayta boshlash", callback_data=f"retake:{quiz_id}")
-        ]])
+        total = module_end - module_start
+        total_modules = db.count_modules(quiz_id)
+        has_next = module_number < total_modules
+        kb = module_result_keyboard(quiz_id, module_number, attempt["id"], has_next)
         await bot.send_message(
             chat_id,
-            f"Test tugadi!\nNatija: {score}/{total}",
+            f"Test {module_number} tugadi!\nNatija: {score}/{total}",
             reply_markup=kb,
         )
         return
+
     q = questions[idx]
     await bot.send_message(
         chat_id,
-        f"Savol {idx + 1}/{len(questions)}:\n\n{q['question_text']}",
+        f"Savol {idx - module_start + 1}/{module_end - module_start}:\n\n{q['question_text']}",
         reply_markup=question_keyboard(quiz_id, idx, q["options"]),
     )
 
@@ -180,21 +237,31 @@ async def cmd_start(message: Message, command: CommandObject):
         if ref_id != message.from_user.id:
             referred_by = ref_id
     db.upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, referred_by)
+    await message.answer(
+        "Assalomu alaykum! 👋\n\n"
+        "Huquq fanidan testlar shu yerda. Pastdagi menyudan foydalaning 👇\n\n"
+        "🏆 Har oy TOP-3 faolga pul bonusi!",
+        reply_markup=main_reply_keyboard(),
+    )
+
+
+@dp.message(F.text == BTN_TESTLAR)
+async def on_testlar_pressed(message: Message):
     quizzes = db.list_quizzes()
     if not quizzes:
         await message.answer("Hozircha testlar mavjud emas. Tez orada qo'shiladi!")
         return
-    await message.answer(
-        "Assalomu alaykum! 👋\n\n"
-        "Bu yerda huquq fanidan <b>cheksiz mavzulashtirilgan testlar</b> mavjud — "
-        "Konstitutsiyaviy huquq, Oila huquqi va boshqa mavzular.\n\n"
-        "Har bir mavzudan bir nechta savolni <b>bepul</b> sinab ko'rishingiz mumkin.\n\n"
-        "🏆 <b>TOP-3 reytingga chiqqan faollarga 500 000 so'm bonus</b> kartangizga o'tkaziladi! "
-        "Reyting — eng ko'p test ishlagan va eng ko'p to'g'ri javob topgan pullik foydalanuvchilar orasida aniqlanadi.\n\n"
-        "Mavzuni tanlang 👇",
-        reply_markup=main_menu_keyboard(),
-        parse_mode="HTML",
-    )
+    await message.answer("Mavzuni tanlang 👇", reply_markup=topics_keyboard())
+
+
+@dp.message(F.text == BTN_REYTING)
+async def on_reyting_button(message: Message):
+    await send_leaderboard(message.chat.id)
+
+
+@dp.message(F.text == BTN_TARIX)
+async def on_tarix_button(message: Message):
+    await send_history(message.chat.id, message.from_user.id)
 
 
 @dp.message(Command("reyting"))
@@ -205,6 +272,17 @@ async def cmd_reyting(message: Message):
 @dp.callback_query(F.data == "leaderboard")
 async def on_leaderboard_pressed(callback: CallbackQuery):
     await send_leaderboard(callback.message.chat.id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "topics")
+async def on_topics_pressed(callback: CallbackQuery):
+    quizzes = db.list_quizzes()
+    if not quizzes:
+        await callback.message.answer("Hozircha testlar mavjud emas. Tez orada qo'shiladi!")
+        await callback.answer()
+        return
+    await callback.message.answer("Mavzuni tanlang 👇", reply_markup=topics_keyboard())
     await callback.answer()
 
 
@@ -263,8 +341,8 @@ async def on_daily_answer(callback: CallbackQuery):
     await callback.message.answer("Ertaga yana bepul savol oling! Barcha testlarni ko'rish uchun /start bosing.")
 
 
-@dp.callback_query(F.data.startswith("quiz:"))
-async def on_quiz_selected(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("topic:"))
+async def on_topic_selected(callback: CallbackQuery):
     quiz_id = int(callback.data.split(":")[1])
     quiz = db.get_quiz(quiz_id)
     user_id = callback.from_user.id
@@ -274,24 +352,58 @@ async def on_quiz_selected(callback: CallbackQuery):
         await callback.answer()
         return
 
+    total_modules = db.count_modules(quiz_id)
+    if total_modules == 0:
+        await callback.message.answer("Bu mavzuda hali savollar yo'q.")
+        await callback.answer()
+        return
+
+    completed = db.get_completed_modules(user_id, quiz_id)
+    await callback.message.answer(
+        f"{quiz['title']} — testni tanlang 👇",
+        reply_markup=modules_keyboard(quiz_id, total_modules, completed),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("module:"))
+async def on_module_selected(callback: CallbackQuery):
+    _, quiz_id, module_number = callback.data.split(":")
+    quiz_id, module_number = int(quiz_id), int(module_number)
+    quiz = db.get_quiz(quiz_id)
+    user_id = callback.from_user.id
+
+    if db.has_any_pending_purchase(user_id) and not db.has_any_confirmed_purchase(user_id):
+        await callback.message.answer("To'lovingiz hali tasdiqlanmoqda. Iltimos kuting.")
+        await callback.answer()
+        return
+
+    db.start_attempt(user_id, quiz_id, module_number)
     attempt = db.get_active_attempt(user_id, quiz_id)
-    if attempt is None:
-        db.start_attempt(user_id, quiz_id)
-        attempt = db.get_active_attempt(user_id, quiz_id)
-    await callback.message.answer(f"{quiz['title']} boshlandi!")
+    await callback.message.answer(f"{quiz['title']} — Test {module_number} boshlandi!")
     await send_question(callback.message.chat.id, quiz_id, attempt, user_id)
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("retake:"))
-async def on_retake_pressed(callback: CallbackQuery):
-    quiz_id = int(callback.data.split(":")[1])
-    quiz = db.get_quiz(quiz_id)
-    user_id = callback.from_user.id
-    db.start_attempt(user_id, quiz_id)
-    attempt = db.get_active_attempt(user_id, quiz_id)
-    await callback.message.answer(f"{quiz['title']} qayta boshlandi!")
-    await send_question(callback.message.chat.id, quiz_id, attempt, user_id)
+@dp.callback_query(F.data.startswith("tahlil:"))
+async def on_tahlil_pressed(callback: CallbackQuery):
+    attempt_id = int(callback.data.split(":")[1])
+    answers = db.get_attempt_answers(attempt_id)
+    if not answers:
+        await callback.message.answer("Tahlil topilmadi.")
+        await callback.answer()
+        return
+    lines = ["📊 <b>Tahlil</b>\n"]
+    for i, a in enumerate(answers, 1):
+        mark = "✅" if a["is_correct"] else "❌"
+        lines.append(f"{i}. {a['question_text']}")
+        lines.append(f"Sizning javobingiz: {a['selected_text']} {mark}")
+        if not a["is_correct"]:
+            lines.append(f"To'g'ri javob: {a['correct_text']}")
+        if a["explanation"]:
+            lines.append(f"ℹ️ {a['explanation']}")
+        lines.append("")
+    await callback.message.answer("\n".join(lines), parse_mode="HTML")
     await callback.answer()
 
 
@@ -374,6 +486,7 @@ async def on_answer(callback: CallbackQuery):
     q = questions[q_index]
     correct = (chosen == q["correct_index"])
 
+    db.record_answer(attempt["id"], q["id"], chosen, correct)
     db.advance_attempt(attempt["id"], correct)
     feedback = "✅ To'g'ri!" if correct else f"❌ Noto'g'ri. To'g'ri javob: {q['options'][q['correct_index']]}"
     await callback.answer(feedback, show_alert=not correct)
@@ -665,9 +778,6 @@ async def addq_got_explanation(message: Message, state: FSMContext):
         f"Yana savol qo'shish uchun savol matnini yuboring, "
         f"yoki /done deb yozib tugating."
     )
-
-
-
 
 
 # ---------------- entrypoint ----------------

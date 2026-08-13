@@ -4,6 +4,8 @@ from contextlib import contextmanager
 
 from config import DB_PATH
 
+MODULE_SIZE = 10
+
 
 @contextmanager
 def get_db():
@@ -65,6 +67,14 @@ def init_db():
             finished INTEGER DEFAULT 0,
             started_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS attempt_answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attempt_id INTEGER NOT NULL,
+            question_id INTEGER NOT NULL,
+            selected_index INTEGER NOT NULL,
+            is_correct INTEGER NOT NULL
+        );
         """)
         cols = [r["name"] for r in db.execute("PRAGMA table_info(quizzes)").fetchall()]
         if "free_questions" not in cols:
@@ -83,6 +93,10 @@ def init_db():
         pcols = [r["name"] for r in db.execute("PRAGMA table_info(purchases)").fetchall()]
         if "price_uzs" not in pcols:
             db.execute("ALTER TABLE purchases ADD COLUMN price_uzs INTEGER")
+
+        acols = [r["name"] for r in db.execute("PRAGMA table_info(attempts)").fetchall()]
+        if "module_number" not in acols:
+            db.execute("ALTER TABLE attempts ADD COLUMN module_number INTEGER DEFAULT 1")
 
 
 # ---------- users ----------
@@ -225,6 +239,13 @@ def count_questions(quiz_id):
         return row["c"]
 
 
+def count_modules(quiz_id):
+    n = count_questions(quiz_id)
+    if not n:
+        return 0
+    return (n + MODULE_SIZE - 1) // MODULE_SIZE
+
+
 def add_question(quiz_id, question_text, options, correct_index, order_index=0, explanation=None):
     with get_db() as db:
         db.execute(
@@ -333,7 +354,8 @@ def get_pending_quiz_id(user_id):
 # ---------- leaderboard ----------
 
 def get_leaderboard(limit=10):
-    """Ranking among paying users only: most questions answered, then most correct answers."""
+    """Ranking among paying users only, for the CURRENT calendar month:
+    most questions answered, then most correct answers. Resets automatically each month."""
     with get_db() as db:
         rows = db.execute(
             "SELECT a.user_id, u.username, u.first_name, "
@@ -342,6 +364,7 @@ def get_leaderboard(limit=10):
             "FROM attempts a "
             "JOIN users u ON u.telegram_id = a.user_id "
             "WHERE a.user_id IN (SELECT DISTINCT user_id FROM purchases WHERE status='confirmed') "
+            "AND strftime('%Y-%m', a.started_at) = strftime('%Y-%m', 'now') "
             "GROUP BY a.user_id "
             "ORDER BY total_answered DESC, total_correct DESC "
             "LIMIT ?",
@@ -352,15 +375,22 @@ def get_leaderboard(limit=10):
 
 # ---------- attempts ----------
 
-def start_attempt(user_id, quiz_id):
+def start_attempt(user_id, quiz_id, module_number=1):
     with get_db() as db:
+        old = db.execute(
+            "SELECT id FROM attempts WHERE user_id=? AND quiz_id=? AND finished=0",
+            (user_id, quiz_id),
+        ).fetchall()
+        for row in old:
+            db.execute("DELETE FROM attempt_answers WHERE attempt_id=?", (row["id"],))
         db.execute(
             "DELETE FROM attempts WHERE user_id=? AND quiz_id=? AND finished=0",
             (user_id, quiz_id),
         )
+        start_index = (module_number - 1) * MODULE_SIZE
         cur = db.execute(
-            "INSERT INTO attempts (user_id, quiz_id, current_index, score) VALUES (?, ?, 0, 0)",
-            (user_id, quiz_id),
+            "INSERT INTO attempts (user_id, quiz_id, current_index, score, module_number) VALUES (?, ?, ?, 0, ?)",
+            (user_id, quiz_id, start_index, module_number),
         )
         return cur.lastrowid
 
@@ -391,3 +421,55 @@ def advance_attempt(attempt_id, correct):
 def finish_attempt(attempt_id):
     with get_db() as db:
         db.execute("UPDATE attempts SET finished=1 WHERE id=?", (attempt_id,))
+
+
+def record_answer(attempt_id, question_id, selected_index, is_correct):
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO attempt_answers (attempt_id, question_id, selected_index, is_correct) "
+            "VALUES (?, ?, ?, ?)",
+            (attempt_id, question_id, selected_index, 1 if is_correct else 0),
+        )
+
+
+def get_attempt_answers(attempt_id):
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT aa.selected_index, aa.is_correct, q.question_text, q.options, q.correct_index, q.explanation "
+            "FROM attempt_answers aa JOIN questions q ON q.id = aa.question_id "
+            "WHERE aa.attempt_id=? ORDER BY aa.id",
+            (attempt_id,),
+        ).fetchall()
+        result = []
+        for r in rows:
+            opts = json.loads(r["options"])
+            result.append({
+                "question_text": r["question_text"],
+                "selected_text": opts[r["selected_index"]],
+                "correct_text": opts[r["correct_index"]],
+                "is_correct": bool(r["is_correct"]),
+                "explanation": r["explanation"],
+            })
+        return result
+
+
+def get_completed_modules(user_id, quiz_id):
+    """Module numbers the user has fully answered (not just paywall-cut-short)."""
+    total_q = count_questions(quiz_id)
+    if not total_q:
+        return set()
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT id, module_number FROM attempts WHERE user_id=? AND quiz_id=? AND finished=1",
+            (user_id, quiz_id),
+        ).fetchall()
+        completed = set()
+        for r in rows:
+            answered = db.execute(
+                "SELECT COUNT(*) AS c FROM attempt_answers WHERE attempt_id=?", (r["id"],)
+            ).fetchone()["c"]
+            module_start = (r["module_number"] - 1) * MODULE_SIZE
+            module_size = min(MODULE_SIZE, total_q - module_start)
+            if module_size > 0 and answered >= module_size:
+                completed.add(r["module_number"])
+        return completed

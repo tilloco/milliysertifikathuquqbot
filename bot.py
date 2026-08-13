@@ -27,8 +27,10 @@ dp = Dispatcher(storage=MemoryStorage())
 MODULE_SIZE = 10
 
 BTN_TESTLAR = "📝 Testlar"
+BTN_TAKLIF = "💡 Taklif-fikr"
 BTN_REYTING = "🏆 Reyting"
 BTN_TARIX = "🕐 Tarix"
+BTN_TOLOV = "💳 To'lov holati"
 
 
 class AddQuestion(StatesGroup):
@@ -38,6 +40,10 @@ class AddQuestion(StatesGroup):
     waiting_correct = State()
     waiting_explanation = State()
     waiting_bulk_file = State()
+
+
+class Feedback(StatesGroup):
+    waiting_text = State()
 
 
 def parse_bulk_questions(text):
@@ -85,10 +91,28 @@ def parse_bulk_questions(text):
 def main_reply_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_TESTLAR), KeyboardButton(text=BTN_REYTING)],
-            [KeyboardButton(text=BTN_TARIX)],
+            [KeyboardButton(text=BTN_TESTLAR), KeyboardButton(text=BTN_TAKLIF)],
+            [KeyboardButton(text=BTN_REYTING), KeyboardButton(text=BTN_TARIX)],
+            [KeyboardButton(text=BTN_TOLOV)],
         ],
         resize_keyboard=True,
+    )
+
+
+async def send_referral_info(message: Message):
+    bot_info = await bot.get_me()
+    link = f"https://t.me/{bot_info.username}?start={message.from_user.id}"
+    count = db.count_referrals(message.from_user.id)
+    remaining = max(0, 3 - count)
+    if remaining == 0:
+        status = "Tabriklaymiz! Sizga 20% chegirma faollashtirildi. Keyingi to'lovda shu chegirma qo'llanadi."
+    else:
+        status = f"Sizga yana {remaining} ta do'stingiz kerak — 20% chegirma uchun."
+    await message.answer(
+        f"🎁 Do'stlaringizni taklif qiling!\n\n"
+        f"Sizning havolangiz:\n{link}\n\n"
+        f"3 ta do'stingiz botdan foydalansa, keyingi xaridingizga 20% chegirma olasiz.\n\n"
+        f"Hozirgi taklif qilganlar soni: {count}\n{status}"
     )
 
 
@@ -264,6 +288,47 @@ async def on_tarix_button(message: Message):
     await send_history(message.chat.id, message.from_user.id)
 
 
+@dp.message(F.text == BTN_TAKLIF)
+async def on_taklif_button(message: Message, state: FSMContext):
+    await state.set_state(Feedback.waiting_text)
+    await message.answer(
+        "💡 Bot haqida fikringiz, taklifingiz yoki shikoyatingiz bormi?\n\n"
+        "Yozib yuboring — botni yanada foydali qilishda albatta hisobga olamiz."
+    )
+
+
+@dp.message(StateFilter(Feedback.waiting_text))
+async def on_feedback_received(message: Message, state: FSMContext):
+    await state.clear()
+    if not message.text:
+        await message.answer("Iltimos, fikringizni matn ko'rinishida yuboring.")
+        return
+    if config.ADMIN_ID:
+        await bot.send_message(
+            config.ADMIN_ID,
+            f"💡 Yangi taklif/fikr:\n\n"
+            f"Foydalanuvchi: {message.from_user.full_name} (@{message.from_user.username})\n"
+            f"ID: {message.from_user.id}\n\n"
+            f"{message.text}",
+        )
+    await message.answer("Rahmat! Fikringiz uchun rahmat 🙏 Botni yanada yaxshilashda albatta hisobga olamiz.")
+
+
+@dp.message(F.text == BTN_TOLOV)
+async def on_tolov_button(message: Message):
+    user_id = message.from_user.id
+    if db.has_any_confirmed_purchase(user_id):
+        await message.answer("✅ Siz premiumdasiz — barcha testlardan bemalol foydalaning! 🎉")
+    elif db.has_any_pending_purchase(user_id):
+        await message.answer("⏳ To'lovingiz hali tasdiqlanmoqda. Iltimos, biroz kuting.")
+    else:
+        await message.answer(
+            "❌ Siz hali sotib olmagansiz.\n\n"
+            "Har bir mavzudan bepul sinov savollarini yechib ko'ring, so'ng barcha mavzularga "
+            "umrbod kirish uchun bir martalik to'lov qilishingiz mumkin."
+        )
+
+
 @dp.message(Command("reyting"))
 async def cmd_reyting(message: Message):
     await send_leaderboard(message.chat.id)
@@ -288,20 +353,7 @@ async def on_topics_pressed(callback: CallbackQuery):
 
 @dp.message(Command("taklif"))
 async def cmd_referral(message: Message):
-    bot_info = await bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start={message.from_user.id}"
-    count = db.count_referrals(message.from_user.id)
-    remaining = max(0, 3 - count)
-    if remaining == 0:
-        status = "Tabriklaymiz! Sizga 20% chegirma faollashtirildi. Keyingi to'lovda shu chegirma qo'llanadi."
-    else:
-        status = f"Sizga yana {remaining} ta do'stingiz kerak — 20% chegirma uchun."
-    await message.answer(
-        f"Do'stlaringizni taklif qiling!\n\n"
-        f"Sizning havolangiz:\n{link}\n\n"
-        f"3 ta do'stingiz botdan foydalansa, keyingi xaridingizga 20% chegirma olasiz.\n\n"
-        f"Hozirgi taklif qilganlar soni: {count}\n{status}"
-    )
+    await send_referral_info(message)
 
 
 @dp.message(Command("kunlik"))
@@ -521,6 +573,19 @@ async def cmd_confirm(message: Message, command: CommandObject):
         user_id,
         "✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor. /start bosing.",
     )
+
+
+@dp.message(Command("resetuser"))
+async def cmd_resetuser(message: Message, command: CommandObject):
+    # Admin/testing helper: wipe a user's purchase history so they hit the paywall again.
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    if not command.args or not command.args.strip().isdigit():
+        await message.answer("Foydalanish: /resetuser <user_id>\n\nO'zingizni sinash uchun o'z ID'ingizni yuboring.")
+        return
+    user_id = int(command.args.strip())
+    db.reset_user_purchases(user_id)
+    await message.answer(f"✅ {user_id} uchun barcha xaridlar tozalandi. Endi u qaytadan bepul sinovdan boshlaydi.")
 
 
 @dp.message(Command("stats"))

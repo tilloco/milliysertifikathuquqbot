@@ -341,6 +341,12 @@ def purchase_status(user_id, quiz_id):
         return row["status"] if row else None
 
 
+def reset_user_purchases(user_id):
+    """Admin/testing helper: wipe a user's purchase history so they hit the paywall again."""
+    with get_db() as db:
+        db.execute("DELETE FROM purchases WHERE user_id=?", (user_id,))
+
+
 def get_pending_quiz_id(user_id):
     with get_db() as db:
         row = db.execute(

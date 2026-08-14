@@ -134,8 +134,9 @@ def modules_keyboard(quiz_id, total_modules, completed, quiz=None, paid=True):
             mark = " 🔒"
         else:
             mark = ""
+        label = db.get_module_label(quiz_id, m)
         kb.inline_keyboard.append([
-            InlineKeyboardButton(text=f"Test {m}{mark}", callback_data=f"module:{quiz_id}:{m}")
+            InlineKeyboardButton(text=f"{label}{mark}", callback_data=f"module:{quiz_id}:{m}")
         ])
     kb.inline_keyboard.append([InlineKeyboardButton(text="📚 Mavzular", callback_data="topics")])
     return kb
@@ -249,9 +250,10 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
         can_continue = has_next_module and (paid or next_is_free)
 
         kb = module_result_keyboard(quiz_id, module_number, attempt["id"], can_continue)
+        label = db.get_module_label(quiz_id, module_number)
         await bot.send_message(
             chat_id,
-            f"Test {module_number} tugadi!\nNatija: {score}/{total}",
+            f"{label} tugadi!\nNatija: {score}/{total}",
             reply_markup=kb,
         )
 
@@ -455,7 +457,8 @@ async def on_module_selected(callback: CallbackQuery):
 
     db.start_attempt(user_id, quiz_id, module_number)
     attempt = db.get_active_attempt(user_id, quiz_id)
-    await callback.message.answer(f"{quiz['title']} — Test {module_number} boshlandi!")
+    label = db.get_module_label(quiz_id, module_number)
+    await callback.message.answer(f"{quiz['title']} — {label} boshlandi!")
     await send_question(callback.message.chat.id, quiz_id, attempt, user_id)
     await callback.answer()
 

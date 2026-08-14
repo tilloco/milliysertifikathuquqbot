@@ -1,5 +1,6 @@
 import sqlite3
 import json
+import re
 from contextlib import contextmanager
 
 from config import DB_PATH
@@ -83,6 +84,8 @@ def init_db():
         qcols = [r["name"] for r in db.execute("PRAGMA table_info(questions)").fetchall()]
         if "explanation" not in qcols:
             db.execute("ALTER TABLE questions ADD COLUMN explanation TEXT")
+        if "article_number" not in qcols:
+            db.execute("ALTER TABLE questions ADD COLUMN article_number INTEGER")
 
         ucols = [r["name"] for r in db.execute("PRAGMA table_info(users)").fetchall()]
         if "referred_by" not in ucols:
@@ -246,12 +249,23 @@ def count_modules(quiz_id):
     return (n + MODULE_SIZE - 1) // MODULE_SIZE
 
 
-def add_question(quiz_id, question_text, options, correct_index, order_index=0, explanation=None):
+_ARTICLE_RE = re.compile(r"(\d+)-modda")
+
+
+def _extract_article_number(text):
+    """Pulls the first 'N-modda' reference out of a question's text, if any."""
+    m = _ARTICLE_RE.search(text or "")
+    return int(m.group(1)) if m else None
+
+
+def add_question(quiz_id, question_text, options, correct_index, order_index=0, explanation=None, article_number=None):
+    if article_number is None:
+        article_number = _extract_article_number(question_text) or _extract_article_number(explanation)
     with get_db() as db:
         db.execute(
-            "INSERT INTO questions (quiz_id, question_text, options, correct_index, order_index, explanation) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (quiz_id, question_text, json.dumps(options, ensure_ascii=False), correct_index, order_index, explanation),
+            "INSERT INTO questions (quiz_id, question_text, options, correct_index, order_index, explanation, article_number) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (quiz_id, question_text, json.dumps(options, ensure_ascii=False), correct_index, order_index, explanation, article_number),
         )
 
 
@@ -266,6 +280,19 @@ def get_questions(quiz_id):
             d["options"] = json.loads(d["options"])
             result.append(d)
         return result
+
+
+def get_module_label(quiz_id, module_number):
+    """Returns 'X-Y-moddalar' if every question in this module has a known article
+    number (used for the Constitution quiz), otherwise falls back to 'Test N'."""
+    questions = get_questions(quiz_id)
+    start = (module_number - 1) * MODULE_SIZE
+    chunk = questions[start:start + MODULE_SIZE]
+    numbers = [q.get("article_number") for q in chunk]
+    if chunk and all(numbers):
+        lo, hi = min(numbers), max(numbers)
+        return f"{lo}-moddalar" if lo == hi else f"{lo}-{hi}-moddalar"
+    return f"Test {module_number}"
 
 
 # ---------- purchases ----------

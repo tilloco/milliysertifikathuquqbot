@@ -445,11 +445,21 @@ async def on_daily_answer(callback: CallbackQuery):
         await callback.answer()
         return
     correct = (chosen == with_db_question["correct_index"])
-    feedback = "✅ To'g'ri!" if correct else f"❌ Noto'g'ri. To'g'ri javob: {with_db_question['options'][with_db_question['correct_index']]}"
-    await callback.answer(feedback, show_alert=True)
+    mark = "✅" if correct else "❌"
+    await callback.answer("✅ To'g'ri!" if correct else "❌ Noto'g'ri")
+
+    result_text = (
+        f"{mark} {with_db_question['question_text']}\n\n"
+        f"To'g'ri javob: {with_db_question['options'][with_db_question['correct_index']]}\n"
+    )
     if with_db_question.get("explanation"):
-        await callback.message.answer(f"ℹ️ Izoh: {with_db_question['explanation']}")
-    await callback.message.answer("Ertaga yana bepul savol oling! Barcha testlarni ko'rish uchun /start bosing.")
+        result_text += f"\nℹ️ <b>Izoh:</b>\n<blockquote>{with_db_question['explanation']}</blockquote>"
+    result_text += "\n\nErtaga yana bepul savol oling! Barcha testlarni ko'rish uchun /start bosing."
+
+    try:
+        await callback.message.edit_text(result_text, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(result_text, parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("topic:"))
@@ -618,20 +628,30 @@ async def on_answer(callback: CallbackQuery):
     db.advance_attempt(attempt["id"], correct)
     if not db.has_any_confirmed_purchase(user_id):
         db.record_daily_free_answer(user_id)
-    feedback = "✅ To'g'ri!" if correct else f"❌ Noto'g'ri. To'g'ri javob: {q['options'][q['correct_index']]}"
-    await callback.answer(feedback, show_alert=not correct)
 
+    # Small toast that auto-dismisses - no blocking popup to interrupt them.
+    await callback.answer("✅ To'g'ri!" if correct else "❌ Noto'g'ri")
+
+    bounds = db.get_module_bounds(quiz_id, attempt["module_number"])
+    module_start = bounds[0] if bounds else (attempt["module_number"] - 1) * MODULE_SIZE
+    q_number = q_index - module_start + 1
+    mark = "✅" if correct else "❌"
+
+    result_text = (
+        f"{mark} <b>{q_number}-savol</b>\n"
+        f"{q['question_text']}\n\n"
+        f"Javobingiz: {q['options'][chosen]}\n"
+        f"To'g'ri javob: {q['options'][q['correct_index']]}\n"
+    )
     if q.get("explanation"):
-        bounds = db.get_module_bounds(quiz_id, attempt["module_number"])
-        module_start = bounds[0] if bounds else (attempt["module_number"] - 1) * MODULE_SIZE
-        q_number = q_index - module_start + 1
-        mark = "✅" if correct else "❌"
-        await callback.message.answer(
-            f"🟢 <b>{mark} {q_number}-savol izohi</b> 🟢\n"
-            f"<blockquote>{q['explanation']}</blockquote>\n"
-            f"<i>— — — — — — — — — —</i>",
-            parse_mode="HTML",
-        )
+        result_text += f"\nℹ️ <b>Izoh:</b>\n<blockquote>{q['explanation']}</blockquote>"
+
+    # Edit the question in place instead of sending a new message - this
+    # doesn't fire a fresh notification the way a new message does.
+    try:
+        await callback.message.edit_text(result_text, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(result_text, parse_mode="HTML")
 
     updated_attempt = db.get_active_attempt(user_id, quiz_id)
     if updated_attempt is None:

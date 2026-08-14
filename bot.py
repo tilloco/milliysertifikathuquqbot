@@ -677,6 +677,30 @@ async def cmd_confirm(message: Message, command: CommandObject):
     )
 
 
+@dp.message(Command("pending"))
+async def cmd_pending(message: Message):
+    # Safety net: lists every unconfirmed payment with user_id + quiz_id, in
+    # case a screenshot notification was ever missed (e.g. ADMIN_ID misconfigured
+    # at the time, or a delivery hiccup). Use /confirm <user_id> <quiz_id> from here.
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    rows = db.list_pending_purchases()
+    if not rows:
+        await message.answer("✅ Kutilayotgan to'lovlar yo'q.")
+        return
+    lines = ["⏳ <b>Kutilayotgan to'lovlar:</b>\n"]
+    for r in rows:
+        name = r["first_name"] or (f"@{r['username']}" if r["username"] else "Noma'lum")
+        price = f"{r['price_uzs']:,} so'm" if r["price_uzs"] else "narx noma'lum"
+        lines.append(
+            f"👤 {name} (ID: {r['user_id']})\n"
+            f"   Mavzu: {r['quiz_title']} (quiz_id: {r['quiz_id']})\n"
+            f"   Narx: {price} | So'ralgan: {r['requested_at']}\n"
+            f"   Tasdiqlash: /confirm {r['user_id']} {r['quiz_id']}\n"
+        )
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 @dp.message(Command("resetuser"))
 async def cmd_resetuser(message: Message, command: CommandObject):
     # Admin/testing helper: wipe a user's purchase history so they hit the paywall again.

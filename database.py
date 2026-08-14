@@ -405,6 +405,22 @@ def request_purchase(user_id, quiz_id, price_uzs=None):
         )
 
 
+def list_pending_purchases():
+    """Safety net for the admin: every pending purchase with user info, in case
+    the automatic screenshot notification was ever missed or misconfigured."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT p.user_id, p.quiz_id, p.price_uzs, p.requested_at, "
+            "u.username, u.first_name, q.title AS quiz_title "
+            "FROM purchases p "
+            "LEFT JOIN users u ON u.telegram_id = p.user_id "
+            "LEFT JOIN quizzes q ON q.id = p.quiz_id "
+            "WHERE p.status='pending' "
+            "ORDER BY p.requested_at ASC"
+        ).fetchall()
+        return rows
+
+
 def confirm_purchase(user_id, quiz_id):
     with get_db() as db:
         db.execute(

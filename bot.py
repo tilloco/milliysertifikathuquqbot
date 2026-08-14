@@ -31,6 +31,7 @@ BTN_TAKLIF = "💡 Taklif-fikr"
 BTN_REYTING = "🏆 Reyting"
 BTN_TARIX = "🕐 Tarix"
 BTN_TOLOV = "💳 To'lov holati"
+BTN_XARID = "🛒 Xarid qilish"
 
 
 class AddQuestion(StatesGroup):
@@ -88,12 +89,16 @@ def parse_bulk_questions(text):
 
 # ---------------- helpers ----------------
 
-def main_reply_keyboard():
+def main_reply_keyboard(paid=False):
+    """paid=True hides the 'Xarid qilish' (purchase) button since it no longer applies."""
+    last_row = [KeyboardButton(text=BTN_TOLOV)] if paid else [
+        KeyboardButton(text=BTN_XARID), KeyboardButton(text=BTN_TOLOV)
+    ]
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_TESTLAR), KeyboardButton(text=BTN_TAKLIF)],
             [KeyboardButton(text=BTN_REYTING), KeyboardButton(text=BTN_TARIX)],
-            [KeyboardButton(text=BTN_TOLOV)],
+            last_row,
         ],
         resize_keyboard=True,
     )
@@ -289,11 +294,12 @@ async def cmd_start(message: Message, command: CommandObject):
         if ref_id != message.from_user.id:
             referred_by = ref_id
     db.upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, referred_by)
+    paid = db.has_any_confirmed_purchase(message.from_user.id)
     await message.answer(
         "Assalomu alaykum! 👋\n\n"
         "Huquq fanidan testlar shu yerda. Pastdagi menyudan foydalaning 👇\n\n"
         "🏆 Har oy TOP-3 faolga pul bonusi!",
-        reply_markup=main_reply_keyboard(),
+        reply_markup=main_reply_keyboard(paid=paid),
     )
 
 
@@ -346,7 +352,10 @@ async def on_feedback_received(message: Message, state: FSMContext):
 async def on_tolov_button(message: Message):
     user_id = message.from_user.id
     if db.has_any_confirmed_purchase(user_id):
-        await message.answer("✅ Siz premiumdasiz — barcha testlardan bemalol foydalaning! 🎉")
+        await message.answer(
+            "✅ Siz premiumdasiz — barcha testlardan bemalol foydalaning! 🎉",
+            reply_markup=main_reply_keyboard(paid=True),
+        )
     elif db.has_any_pending_purchase(user_id):
         await message.answer("⏳ To'lovingiz hali tasdiqlanmoqda. Iltimos, biroz kuting.")
     else:
@@ -355,6 +364,42 @@ async def on_tolov_button(message: Message):
             "Har bir mavzudan bepul sinov savollarini yechib ko'ring, so'ng barcha mavzularga "
             "umrbod kirish uchun bir martalik to'lov qilishingiz mumkin."
         )
+
+
+@dp.message(F.text == BTN_XARID)
+async def on_xarid_button(message: Message):
+    user_id = message.from_user.id
+    if db.has_any_confirmed_purchase(user_id):
+        await message.answer(
+            "✅ Siz allaqachon premiumdasiz — barcha testlardan bemalol foydalaning! 🎉",
+            reply_markup=main_reply_keyboard(paid=True),
+        )
+        return
+    if db.has_any_pending_purchase(user_id):
+        await message.answer("⏳ To'lovingiz hali tasdiqlanmoqda. Iltimos, biroz kuting.")
+        return
+
+    quizzes = db.list_quizzes()
+    if not quizzes:
+        await message.answer("Hozircha testlar mavjud emas.")
+        return
+    quiz_id = quizzes[0]["id"]  # one confirmed purchase unlocks every topic
+
+    price = config.FULL_ACCESS_PRICE_UZS
+    discount_note = ""
+    if db.has_discount(user_id):
+        price = int(price * 0.8)
+        discount_note = " (20% taklif chegirmasi qo'llandi! 🎉)"
+    db.request_purchase(user_id, quiz_id, price_uzs=price)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💳 To'lash", callback_data=f"paycard:{quiz_id}")
+    ]])
+    await message.answer(
+        f"🚀 Barcha mavzulardagi cheksiz testlarga <b>umrbod kirish huquqini</b> xarid qiling!\n\n"
+        f"💰 Narxi: <b>{price:,} so'm</b>{discount_note}",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
 
 
 @dp.message(Command("reyting"))
@@ -549,7 +594,8 @@ async def on_confirm_pressed(callback: CallbackQuery):
     await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ TASDIQLANDI")
     await bot.send_message(
         user_id,
-        "✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor. /start bosing.",
+        "✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor.",
+        reply_markup=main_reply_keyboard(paid=True),
     )
     await callback.answer("Tasdiqlandi")
 
@@ -626,7 +672,8 @@ async def cmd_confirm(message: Message, command: CommandObject):
     await message.answer(f"Tasdiqlandi: user {user_id}, quiz {quiz_id}")
     await bot.send_message(
         user_id,
-        "✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor. /start bosing.",
+        "✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor.",
+        reply_markup=main_reply_keyboard(paid=True),
     )
 
 

@@ -295,6 +295,12 @@ def get_module_label(quiz_id, module_number):
     return f"Test {module_number}"
 
 
+def delete_questions_for_quiz(quiz_id):
+    """Admin helper: wipe every question for a quiz so it can be re-uploaded in clean order."""
+    with get_db() as db:
+        db.execute("DELETE FROM questions WHERE quiz_id=?", (quiz_id,))
+
+
 # ---------- purchases ----------
 
 def request_purchase(user_id, quiz_id, price_uzs=None):

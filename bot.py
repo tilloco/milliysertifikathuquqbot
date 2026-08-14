@@ -670,6 +670,28 @@ async def cmd_addquiz(message: Message, command: CommandObject):
     )
 
 
+@dp.message(Command("clearquestions"))
+async def cmd_clearquestions(message: Message, command: CommandObject):
+    # Admin helper: /clearquestions <quiz_id> - wipes ALL questions for that quiz (irreversible).
+    # Use this before re-uploading files in the correct order (e.g. to fix article numbering).
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    if not command.args or not command.args.strip().isdigit():
+        await message.answer("Foydalanish: /clearquestions <test_id>\n\n⚠️ Bu shu testdagi BARCHA savollarni butunlay o'chiradi!")
+        return
+    quiz_id = int(command.args.strip())
+    quiz = db.get_quiz(quiz_id)
+    if not quiz:
+        await message.answer("Bunday ID li test topilmadi.")
+        return
+    n_before = db.count_questions(quiz_id)
+    db.delete_questions_for_quiz(quiz_id)
+    await message.answer(
+        f"🗑️ \"{quiz['title']}\" testidagi {n_before} ta savol o'chirildi.\n"
+        f"Endi /bulkadd {quiz_id} orqali fayllarni to'g'ri tartibda qaytadan yuklang."
+    )
+
+
 @dp.message(Command("listquizzes"))
 async def cmd_listquizzes(message: Message):
     if message.from_user.id != config.ADMIN_ID:

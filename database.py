@@ -1,11 +1,13 @@
 import sqlite3
 import json
 import re
+import datetime
 from contextlib import contextmanager
 
 from config import DB_PATH
 
 MODULE_SIZE = 10
+DAILY_FREE_LIMIT = 3
 
 
 @contextmanager
@@ -92,6 +94,10 @@ def init_db():
             db.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
         if "last_daily_date" not in ucols:
             db.execute("ALTER TABLE users ADD COLUMN last_daily_date TEXT")
+        if "free_answers_count" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN free_answers_count INTEGER DEFAULT 0")
+        if "free_answers_date" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN free_answers_date TEXT")
 
         pcols = [r["name"] for r in db.execute("PRAGMA table_info(purchases)").fetchall()]
         if "price_uzs" not in pcols:
@@ -125,6 +131,43 @@ def count_referrals(telegram_id):
             "SELECT COUNT(*) AS c FROM users WHERE referred_by=?", (telegram_id,)
         ).fetchone()
         return row["c"]
+
+
+def get_daily_free_used(telegram_id):
+    """How many free questions this (unpaid) user has already answered today."""
+    today = datetime.date.today().isoformat()
+    with get_db() as db:
+        row = db.execute(
+            "SELECT free_answers_count, free_answers_date FROM users WHERE telegram_id=?",
+            (telegram_id,),
+        ).fetchone()
+        if not row or row["free_answers_date"] != today:
+            return 0
+        return row["free_answers_count"] or 0
+
+
+def daily_free_remaining(telegram_id):
+    return max(0, DAILY_FREE_LIMIT - get_daily_free_used(telegram_id))
+
+
+def record_daily_free_answer(telegram_id):
+    """Call once per answered question for a non-paying user. Resets automatically on a new day."""
+    today = datetime.date.today().isoformat()
+    with get_db() as db:
+        row = db.execute(
+            "SELECT free_answers_count, free_answers_date FROM users WHERE telegram_id=?",
+            (telegram_id,),
+        ).fetchone()
+        if not row or row["free_answers_date"] != today:
+            db.execute(
+                "UPDATE users SET free_answers_count=1, free_answers_date=? WHERE telegram_id=?",
+                (today, telegram_id),
+            )
+        else:
+            db.execute(
+                "UPDATE users SET free_answers_count=free_answers_count+1 WHERE telegram_id=?",
+                (telegram_id,),
+            )
 
 
 def has_discount(telegram_id, threshold=3):
@@ -242,11 +285,59 @@ def count_questions(quiz_id):
         return row["c"]
 
 
+ARTICLES_PER_MODULE = 10  # for article-tagged quizzes (e.g. the Constitution): 10 distinct moddas per test
+
+
+def get_module_boundaries(quiz_id):
+    """Splits a quiz's questions into modules (tests).
+
+    For quizzes where every question is tagged with an article_number (e.g. the
+    Constitution), a module is a run of consecutive questions covering exactly
+    ARTICLES_PER_MODULE distinct article numbers - question count per module can
+    vary (one module might be 10 questions, another 14, if some articles needed
+    extra questions). The last, still-filling module can be smaller than 10
+    articles until more questions get appended.
+
+    For quizzes without article numbers, falls back to the old fixed-size
+    MODULE_SIZE (10 questions) chunking.
+
+    Returns a list of (start_index, end_index) tuples, end exclusive.
+    """
+    questions = get_questions(quiz_id)
+    if not questions:
+        return []
+
+    has_articles = all(q.get("article_number") for q in questions)
+    boundaries = []
+
+    if has_articles:
+        start = 0
+        seen = set()
+        for i, q in enumerate(questions):
+            seen.add(q["article_number"])
+            if len(seen) >= ARTICLES_PER_MODULE:
+                boundaries.append((start, i + 1))
+                start = i + 1
+                seen = set()
+        if start < len(questions):
+            boundaries.append((start, len(questions)))
+    else:
+        for start in range(0, len(questions), MODULE_SIZE):
+            boundaries.append((start, min(start + MODULE_SIZE, len(questions))))
+
+    return boundaries
+
+
+def get_module_bounds(quiz_id, module_number):
+    """(start_index, end_index) for a specific 1-based module number, or None if it doesn't exist."""
+    boundaries = get_module_boundaries(quiz_id)
+    if 1 <= module_number <= len(boundaries):
+        return boundaries[module_number - 1]
+    return None
+
+
 def count_modules(quiz_id):
-    n = count_questions(quiz_id)
-    if not n:
-        return 0
-    return (n + MODULE_SIZE - 1) // MODULE_SIZE
+    return len(get_module_boundaries(quiz_id))
 
 
 _ARTICLE_RE = re.compile(r"(\d+)-modda")
@@ -283,13 +374,15 @@ def get_questions(quiz_id):
 
 
 def get_module_label(quiz_id, module_number):
-    """Returns 'X-Y-moddalar' if every question in this module has a known article
-    number (used for the Constitution quiz), otherwise falls back to 'Test N'."""
-    questions = get_questions(quiz_id)
-    start = (module_number - 1) * MODULE_SIZE
-    chunk = questions[start:start + MODULE_SIZE]
-    numbers = [q.get("article_number") for q in chunk]
-    if chunk and all(numbers):
+    """Returns 'X-Y-moddalar' for article-tagged quizzes (based on actual module
+    boundaries, which can span more or fewer than 10 questions), otherwise 'Test N'."""
+    bounds = get_module_bounds(quiz_id, module_number)
+    if not bounds:
+        return f"Test {module_number}"
+    start, end = bounds
+    questions = get_questions(quiz_id)[start:end]
+    numbers = [q.get("article_number") for q in questions]
+    if questions and all(numbers):
         lo, hi = min(numbers), max(numbers)
         return f"{lo}-moddalar" if lo == hi else f"{lo}-{hi}-moddalar"
     return f"Test {module_number}"
@@ -415,6 +508,8 @@ def get_leaderboard(limit=10):
 # ---------- attempts ----------
 
 def start_attempt(user_id, quiz_id, module_number=1):
+    bounds = get_module_bounds(quiz_id, module_number)
+    start_index = bounds[0] if bounds else (module_number - 1) * MODULE_SIZE
     with get_db() as db:
         old = db.execute(
             "SELECT id FROM attempts WHERE user_id=? AND quiz_id=? AND finished=0",
@@ -426,7 +521,6 @@ def start_attempt(user_id, quiz_id, module_number=1):
             "DELETE FROM attempts WHERE user_id=? AND quiz_id=? AND finished=0",
             (user_id, quiz_id),
         )
-        start_index = (module_number - 1) * MODULE_SIZE
         cur = db.execute(
             "INSERT INTO attempts (user_id, quiz_id, current_index, score, module_number) VALUES (?, ?, ?, 0, ?)",
             (user_id, quiz_id, start_index, module_number),
@@ -494,8 +588,7 @@ def get_attempt_answers(attempt_id):
 
 def get_completed_modules(user_id, quiz_id):
     """Module numbers the user has fully answered (not just paywall-cut-short)."""
-    total_q = count_questions(quiz_id)
-    if not total_q:
+    if not count_questions(quiz_id):
         return set()
     with get_db() as db:
         rows = db.execute(
@@ -507,8 +600,11 @@ def get_completed_modules(user_id, quiz_id):
             answered = db.execute(
                 "SELECT COUNT(*) AS c FROM attempt_answers WHERE attempt_id=?", (r["id"],)
             ).fetchone()["c"]
-            module_start = (r["module_number"] - 1) * MODULE_SIZE
-            module_size = min(MODULE_SIZE, total_q - module_start)
+            bounds = get_module_bounds(quiz_id, r["module_number"])
+            if not bounds:
+                continue
+            start, end = bounds
+            module_size = end - start
             if module_size > 0 and answered >= module_size:
                 completed.add(r["module_number"])
         return completed

@@ -125,12 +125,14 @@ def topics_keyboard():
     return kb
 
 
-def modules_keyboard(quiz_id, total_modules, completed, quiz=None, paid=True):
+def modules_keyboard(quiz_id, total_modules, completed, daily_locked=False):
+    """daily_locked=True marks every not-yet-completed module with a lock icon
+    (shown when a non-paying user has used up today's free question quota)."""
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for m in range(1, total_modules + 1):
         if m in completed:
             mark = " ✅"
-        elif quiz is not None and not paid and not module_is_free(quiz, m):
+        elif daily_locked:
             mark = " 🔒"
         else:
             mark = ""
@@ -200,15 +202,10 @@ def question_keyboard(quiz_id, q_index, options):
     return kb
 
 
-def module_is_free(quiz, module_number):
-    """A whole module (Test N) is either fully free or fully paid - no mid-module cutoff."""
-    module_start = (module_number - 1) * MODULE_SIZE
-    return module_start < quiz["free_questions"]
-
-
-async def send_paywall_prompt(chat_id, quiz, user_id):
+async def send_daily_limit_prompt(chat_id, quiz, user_id):
+    """Shown when a non-paying user has used up today's free questions (any module, any topic)."""
     if db.has_any_pending_purchase(user_id):
-        await bot.send_message(chat_id, "Bepul sinov tugadi! To'lovingiz hali tasdiqlanmoqda. Iltimos kuting.")
+        await bot.send_message(chat_id, "Bugungi bepul savollaringiz tugadi. To'lovingiz hali tasdiqlanmoqda. Iltimos kuting.")
         return
     price = config.FULL_ACCESS_PRICE_UZS
     discount_note = ""
@@ -221,9 +218,10 @@ async def send_paywall_prompt(chat_id, quiz, user_id):
     ]])
     await bot.send_message(
         chat_id,
-        f"🎯 Siz bepul sinov savollarini yakunladingiz!\n\n"
-        f"Bir martalik to'lov bilan — <b>barcha mavzulardagi cheksiz testlarga</b> "
-        f"umrbod kirish huquqiga ega bo'lasiz. DTM va milliy sertifikatga eng qulay tayyorgarlik yo'li! 🚀\n\n"
+        f"🎯 Bugungi {db.DAILY_FREE_LIMIT} ta bepul savolingiz tugadi!\n\n"
+        f"Ertaga yana {db.DAILY_FREE_LIMIT} ta bepul savolga ega bo'lasiz — yoki hoziroq bir martalik "
+        f"to'lov bilan <b>barcha mavzulardagi cheksiz testlarga</b> umrbod kirish huquqiga ega bo'ling. "
+        f"DTM va milliy sertifikatga eng qulay tayyorgarlik yo'li! 🚀\n\n"
         f"💰 Narxi: <b>{price:,} so'm</b>{discount_note}",
         reply_markup=kb,
         parse_mode="HTML",
@@ -235,8 +233,12 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
     idx = attempt["current_index"]
     quiz = db.get_quiz(quiz_id)
     module_number = attempt["module_number"]
-    module_start = (module_number - 1) * MODULE_SIZE
-    module_end = min(module_start + MODULE_SIZE, len(questions))
+    bounds = db.get_module_bounds(quiz_id, module_number)
+    if bounds:
+        module_start, module_end = bounds
+    else:
+        module_start = (module_number - 1) * MODULE_SIZE
+        module_end = min(module_start + MODULE_SIZE, len(questions))
 
     if idx >= module_end:
         db.finish_attempt(attempt["id"])
@@ -246,10 +248,8 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
         next_module = module_number + 1
         has_next_module = next_module <= total_modules
         paid = db.has_any_confirmed_purchase(user_id)
-        next_is_free = module_is_free(quiz, next_module)
-        can_continue = has_next_module and (paid or next_is_free)
 
-        kb = module_result_keyboard(quiz_id, module_number, attempt["id"], can_continue)
+        kb = module_result_keyboard(quiz_id, module_number, attempt["id"], has_next_module)
         label = db.get_module_label(quiz_id, module_number)
         await bot.send_message(
             chat_id,
@@ -257,9 +257,18 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
             reply_markup=kb,
         )
 
-        # Next module exists but is locked behind payment - show the paywall right under the result.
-        if has_next_module and not paid and not next_is_free:
-            await send_paywall_prompt(chat_id, quiz, user_id)
+        if not paid:
+            remaining = db.daily_free_remaining(user_id)
+            if remaining > 0:
+                await bot.send_message(chat_id, f"🎁 Bugun yana {remaining} ta bepul savolingiz bor - istalgan mavzudan davom eting!")
+            else:
+                await send_daily_limit_prompt(chat_id, quiz, user_id)
+        return
+
+    paid = db.has_any_confirmed_purchase(user_id)
+    if not paid and db.get_daily_free_used(user_id) >= db.DAILY_FREE_LIMIT:
+        db.finish_attempt(attempt["id"])
+        await send_daily_limit_prompt(chat_id, quiz, user_id)
         return
 
     q = questions[idx]
@@ -431,9 +440,18 @@ async def on_topic_selected(callback: CallbackQuery):
 
     completed = db.get_completed_modules(user_id, quiz_id)
     paid = db.has_any_confirmed_purchase(user_id)
+    daily_locked = (not paid) and db.get_daily_free_used(user_id) >= db.DAILY_FREE_LIMIT
+    status_line = ""
+    if not paid:
+        remaining = db.daily_free_remaining(user_id)
+        status_line = (
+            f"\n\n🎁 Bugun yana {remaining} ta bepul savolingiz bor."
+            if remaining > 0
+            else f"\n\n🔒 Bugungi bepul limitingiz tugadi. Ertaga qayting yoki hoziroq to'lang."
+        )
     await callback.message.answer(
-        f"{quiz['title']} — testni tanlang 👇",
-        reply_markup=modules_keyboard(quiz_id, total_modules, completed, quiz=quiz, paid=paid),
+        f"{quiz['title']} — testni tanlang 👇{status_line}",
+        reply_markup=modules_keyboard(quiz_id, total_modules, completed, daily_locked=daily_locked),
     )
     await callback.answer()
 
@@ -450,8 +468,8 @@ async def on_module_selected(callback: CallbackQuery):
         await callback.answer()
         return
 
-    if not db.has_any_confirmed_purchase(user_id) and not module_is_free(quiz, module_number):
-        await send_paywall_prompt(callback.message.chat.id, quiz, user_id)
+    if not db.has_any_confirmed_purchase(user_id) and db.get_daily_free_used(user_id) >= db.DAILY_FREE_LIMIT:
+        await send_daily_limit_prompt(callback.message.chat.id, quiz, user_id)
         await callback.answer()
         return
 
@@ -566,11 +584,14 @@ async def on_answer(callback: CallbackQuery):
 
     db.record_answer(attempt["id"], q["id"], chosen, correct)
     db.advance_attempt(attempt["id"], correct)
+    if not db.has_any_confirmed_purchase(user_id):
+        db.record_daily_free_answer(user_id)
     feedback = "✅ To'g'ri!" if correct else f"❌ Noto'g'ri. To'g'ri javob: {q['options'][q['correct_index']]}"
     await callback.answer(feedback, show_alert=not correct)
 
     if q.get("explanation"):
-        module_start = (attempt["module_number"] - 1) * MODULE_SIZE
+        bounds = db.get_module_bounds(quiz_id, attempt["module_number"])
+        module_start = bounds[0] if bounds else (attempt["module_number"] - 1) * MODULE_SIZE
         q_number = q_index - module_start + 1
         mark = "✅" if correct else "❌"
         await callback.message.answer(

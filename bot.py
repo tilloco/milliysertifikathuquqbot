@@ -32,6 +32,15 @@ BTN_REYTING = "🏆 Reyting"
 BTN_TARIX = "🕐 Tarix"
 BTN_TOLOV = "💳 To'lov"
 
+# Shown wherever a buyer is deciding whether to pay - the guarantee and a
+# real person to ask reduce the "will I get scammed" hesitation that's the
+# biggest reason someone with money in hand still doesn't buy.
+TRUST_NOTE = (
+    f"🛡 <b>Kafolat:</b> xarid qilgan kundan boshlab {config.REFUND_DAYS} kun ichida "
+    f"biron sababga ko'ra qoniqmasangiz — pulingiz to'liq va so'zsiz qaytariladi.\n"
+    f"❓ Savollar uchun: {config.SUPPORT_USERNAME}"
+)
+
 
 class AddQuestion(StatesGroup):
     waiting_quiz_id = State()
@@ -224,7 +233,8 @@ async def send_daily_limit_prompt(chat_id, quiz, user_id):
         f"Ertaga yana {db.DAILY_FREE_LIMIT} ta bepul savolga ega bo'lasiz — yoki hoziroq bir martalik "
         f"to'lov bilan <b>barcha mavzulardagi cheksiz testlarga</b> umrbod kirish huquqiga ega bo'ling. "
         f"DTM va milliy sertifikatga eng qulay tayyorgarlik yo'li! 🚀\n\n"
-        f"💰 Narxi: <b>{price:,} so'm</b>{discount_note}",
+        f"💰 Narxi: <b>{price:,} so'm</b>{discount_note}\n\n"
+        f"{TRUST_NOTE}",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -324,7 +334,8 @@ async def on_taklif_button(message: Message, state: FSMContext):
     await state.set_state(Feedback.waiting_text)
     await message.answer(
         "💡 Bot haqida fikringiz, taklifingiz yoki shikoyatingiz bormi?\n\n"
-        "Yozib yuboring — botni yanada foydali qilishda albatta hisobga olamiz."
+        "Yozib yuboring — botni yanada foydali qilishda albatta hisobga olamiz.\n\n"
+        f"Tezroq javob kerak bo'lsa, to'g'ridan-to'g'ri {config.SUPPORT_USERNAME} ga yozishingiz ham mumkin."
     )
 
 
@@ -353,8 +364,19 @@ async def on_tolov_button(message: Message):
     user_id = message.from_user.id
 
     if db.has_any_confirmed_purchase(user_id):
+        purchase = db.get_confirmed_purchase(user_id)
+        days_left_note = ""
+        if purchase:
+            elapsed = db.days_since_confirmed(user_id, purchase["quiz_id"])
+            if elapsed is not None:
+                remaining_days = max(0, config.REFUND_DAYS - elapsed)
+                if remaining_days > 0:
+                    days_left_note = (
+                        f"\n\n🛡 Pul qaytarish kafolati muddati: yana {remaining_days} kun. "
+                        f"Savol bo'lsa {config.SUPPORT_USERNAME} ga yozing."
+                    )
         await message.answer(
-            "✅ Siz premiumdasiz — barcha testlardan bemalol foydalaning! 🎉",
+            f"✅ Siz premiumdasiz — barcha testlardan bemalol foydalaning! 🎉{days_left_note}",
             reply_markup=main_reply_keyboard(paid=True),
         )
         return
@@ -383,7 +405,8 @@ async def on_tolov_button(message: Message):
         f"{config.PAYMENT_INSTRUCTIONS}\n\n"
         f"💰 Narxi: <b>{price:,} so'm</b>{discount_note}\n\n"
         f"To'lov qilgach, screenshotni shu botga rasm qilib yuboring 📸\n\n"
-        f"{status_line}",
+        f"{status_line}\n\n"
+        f"{TRUST_NOTE}",
         parse_mode="HTML",
     )
 
@@ -548,7 +571,9 @@ async def on_tahlil_pressed(callback: CallbackQuery):
 async def on_paycard_pressed(callback: CallbackQuery):
     await callback.message.answer(
         f"{config.PAYMENT_INSTRUCTIONS}\n\n"
-        f"To'lov qilgach, screenshotni shu botga rasm qilib yuboring 📸"
+        f"To'lov qilgach, screenshotni shu botga rasm qilib yuboring 📸\n\n"
+        f"{TRUST_NOTE}",
+        parse_mode="HTML",
     )
     await callback.answer()
 
@@ -590,8 +615,10 @@ async def on_confirm_pressed(callback: CallbackQuery):
     await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ TASDIQLANDI")
     await bot.send_message(
         user_id,
-        "✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor.",
+        f"✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor.\n\n"
+        f"{TRUST_NOTE}",
         reply_markup=main_reply_keyboard(paid=True),
+        parse_mode="HTML",
     )
     await callback.answer("Tasdiqlandi")
 
@@ -678,8 +705,47 @@ async def cmd_confirm(message: Message, command: CommandObject):
     await message.answer(f"Tasdiqlandi: user {user_id}, quiz {quiz_id}")
     await bot.send_message(
         user_id,
-        "✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor.",
+        f"✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor.\n\n"
+        f"{TRUST_NOTE}",
         reply_markup=main_reply_keyboard(paid=True),
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("refund"))
+async def cmd_refund(message: Message, command: CommandObject):
+    """Admin helper: /refund <user_id> <quiz_id>
+
+    Use this ONLY AFTER you've manually sent the money back to the buyer's
+    card. This revokes their access immediately and sends them a confirmation
+    message. Refunds are honored any time within the guarantee window
+    advertised to buyers (config.REFUND_DAYS), but nothing here enforces that
+    automatically - it's on you to check /pending-style context or the
+    buyer's message before sending the money back.
+    """
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    if not command.args:
+        await message.answer("Foydalanish: /refund <user_id> <quiz_id>")
+        return
+    parts = command.args.split()
+    if len(parts) != 2:
+        await message.answer("Foydalanish: /refund <user_id> <quiz_id>")
+        return
+    user_id, quiz_id = int(parts[0]), int(parts[1])
+
+    purchase = db.get_purchase(user_id, quiz_id)
+    if not purchase or purchase["status"] != "confirmed":
+        await message.answer("Bu foydalanuvchida shu test uchun tasdiqlangan xarid topilmadi.")
+        return
+
+    db.refund_purchase(user_id, quiz_id)
+    await message.answer(f"✅ Pul qaytarildi deb belgilandi: user {user_id}, quiz {quiz_id}. Kirish huquqi bekor qilindi.")
+    await bot.send_message(
+        user_id,
+        "💸 Pulingiz to'liq qaytarildi.\n\n"
+        "Agar kelajakda fikringiz o'zgarsa, botimiz doim tayyor turadi.\n\n"
+        f"Savollaringiz bo'lsa, {config.SUPPORT_USERNAME} ga yozishingiz mumkin.",
     )
 
 
@@ -740,6 +806,7 @@ async def cmd_stats(message: Message):
         f"   Tasdiqlangan: {by_status.get('confirmed', 0)}",
         f"   Kutilmoqda: {by_status.get('pending', 0)}",
         f"   Rad etilgan: {by_status.get('rejected', 0)}",
+        f"   Pul qaytarilgan: {by_status.get('refunded', 0)}",
         f"   Jami tushum: {revenue:,} so'm",
         "",
         "📊 Testlar bo'yicha qiziqish:",
@@ -760,7 +827,7 @@ async def cmd_addquiz(message: Message, command: CommandObject):
         return
     parts = [p.strip() for p in command.args.split("|")]
     title, description, price = parts[0], parts[1], int(parts[2])
-    free_questions = int(parts[3]) if len(parts) > 3 else 3
+    free_questions = int(parts[3]) if len(parts) > 3 else 10
     quiz_id = db.add_quiz(title, description, price, free_questions=free_questions)
     await message.answer(
         f"Test qo'shildi. ID = {quiz_id}. Bepul savollar: {free_questions} ta.\n"

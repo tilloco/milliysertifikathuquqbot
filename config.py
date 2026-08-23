@@ -15,6 +15,13 @@ PAYMENT_INSTRUCTIONS = os.getenv(
     "To'lovdan so'ng screenshot yuboring, biz tasdiqlaymiz."
 )
 
+# Shown next to payment info and the daily-limit paywall, for trust and support questions.
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@xakimov_63")
+
+# Money-back guarantee window, counted from the day the purchase is CONFIRMED
+# (not the day it was requested). Admin processes refunds manually with /refund.
+REFUND_DAYS = int(os.getenv("REFUND_DAYS", "3"))
+
 VOLUME_PATH = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ".")
 DB_PATH = os.getenv("DB_PATH", os.path.join(VOLUME_PATH, "lawquiz.db"))
 

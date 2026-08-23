@@ -56,7 +56,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             quiz_id INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',  -- pending | confirmed | rejected
+            status TEXT NOT NULL DEFAULT 'pending',  -- pending | confirmed | rejected | refunded
             requested_at TEXT DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_id, quiz_id)
         );
@@ -102,6 +102,8 @@ def init_db():
         pcols = [r["name"] for r in db.execute("PRAGMA table_info(purchases)").fetchall()]
         if "price_uzs" not in pcols:
             db.execute("ALTER TABLE purchases ADD COLUMN price_uzs INTEGER")
+        if "confirmed_at" not in pcols:
+            db.execute("ALTER TABLE purchases ADD COLUMN confirmed_at TEXT")
 
         acols = [r["name"] for r in db.execute("PRAGMA table_info(attempts)").fetchall()]
         if "module_number" not in acols:
@@ -424,7 +426,8 @@ def list_pending_purchases():
 def confirm_purchase(user_id, quiz_id):
     with get_db() as db:
         db.execute(
-            "UPDATE purchases SET status='confirmed' WHERE user_id=? AND quiz_id=?",
+            "UPDATE purchases SET status='confirmed', confirmed_at=CURRENT_TIMESTAMP "
+            "WHERE user_id=? AND quiz_id=?",
             (user_id, quiz_id),
         )
 
@@ -435,6 +438,38 @@ def reject_purchase(user_id, quiz_id):
             "UPDATE purchases SET status='rejected' WHERE user_id=? AND quiz_id=?",
             (user_id, quiz_id),
         )
+
+
+def refund_purchase(user_id, quiz_id):
+    """Admin calls this AFTER manually sending the money back to the buyer's
+    card. Marks the purchase refunded, which revokes access immediately
+    (has_any_confirmed_purchase only counts status='confirmed')."""
+    with get_db() as db:
+        db.execute(
+            "UPDATE purchases SET status='refunded' WHERE user_id=? AND quiz_id=?",
+            (user_id, quiz_id),
+        )
+
+
+def get_purchase(user_id, quiz_id):
+    with get_db() as db:
+        return db.execute(
+            "SELECT * FROM purchases WHERE user_id=? AND quiz_id=?",
+            (user_id, quiz_id),
+        ).fetchone()
+
+
+def days_since_confirmed(user_id, quiz_id):
+    """Days elapsed since this purchase was confirmed, or None if not confirmed
+    (or confirmed before this column existed - treat as unknown)."""
+    row = get_purchase(user_id, quiz_id)
+    if not row or not row["confirmed_at"]:
+        return None
+    try:
+        confirmed = datetime.datetime.fromisoformat(row["confirmed_at"])
+    except ValueError:
+        return None
+    return (datetime.datetime.utcnow() - confirmed).days
 
 
 def has_access(user_id, quiz_id):
@@ -463,6 +498,15 @@ def has_any_pending_purchase(user_id):
             (user_id,),
         ).fetchone()
         return row is not None
+
+
+def get_confirmed_purchase(user_id):
+    """The user's confirmed purchase row (any topic - one payment unlocks all), or None."""
+    with get_db() as db:
+        return db.execute(
+            "SELECT * FROM purchases WHERE user_id=? AND status='confirmed' LIMIT 1",
+            (user_id,),
+        ).fetchone()
 
 
 def purchase_price(user_id, quiz_id):

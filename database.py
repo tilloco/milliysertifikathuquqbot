@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from config import DB_PATH
 
 MODULE_SIZE = 10
-DAILY_FREE_LIMIT = 3
+DAILY_FREE_LIMIT = 10
 
 
 @contextmanager

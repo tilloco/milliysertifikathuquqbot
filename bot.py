@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.types import (
@@ -40,6 +41,32 @@ TRUST_NOTE = (
     f"biron sababga ko'ra qoniqmasangiz — pulingiz to'liq va so'zsiz qaytariladi.\n"
     f"❓ Savollar uchun: {config.SUPPORT_USERNAME}"
 )
+
+
+async def sync_premium_to_miniweb(telegram_id: int, is_premium: bool) -> bool:
+    """Tells the Mini App backend to update this user's premium status, so a
+    payment confirmed/refunded here takes effect there too without any manual
+    step. Never raises - a sync failure shouldn't break the confirm/refund
+    flow in the bot itself; admin can retry with /syncpremium if it fails."""
+    if not config.MINIWEB_ADMIN_KEY:
+        logging.warning("MINIWEB_ADMIN_KEY not set - skipping Mini App premium sync")
+        return False
+    url = f"{config.MINIWEB_ADMIN_URL}/admin/set-premium?key={config.MINIWEB_ADMIN_KEY}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                json={"telegram_id": telegram_id, "is_premium": is_premium},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logging.warning(f"Mini App premium sync failed ({resp.status}): {body}")
+                    return False
+                return True
+    except Exception as e:
+        logging.warning(f"Mini App premium sync error: {e}")
+        return False
 
 
 class AddQuestion(StatesGroup):
@@ -612,10 +639,13 @@ async def on_confirm_pressed(callback: CallbackQuery):
     _, user_id, quiz_id = callback.data.split(":")
     user_id, quiz_id = int(user_id), int(quiz_id)
     db.confirm_purchase(user_id, quiz_id)
-    await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ TASDIQLANDI")
+    synced = await sync_premium_to_miniweb(user_id, True)
+    sync_note = "" if synced else "\n⚠️ Mini App sinxronlanmadi - /syncpremium buyrug'i bilan qo'lda urinib ko'ring."
+    await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ TASDIQLANDI" + sync_note)
     await bot.send_message(
         user_id,
-        f"✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor.\n\n"
+        f"✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor "
+        f"— bot ichida ham, Mini App'da ham.\n\n"
         f"{TRUST_NOTE}",
         reply_markup=main_reply_keyboard(paid=True),
         parse_mode="HTML",
@@ -702,10 +732,13 @@ async def cmd_confirm(message: Message, command: CommandObject):
         return
     user_id, quiz_id = int(parts[0]), int(parts[1])
     db.confirm_purchase(user_id, quiz_id)
-    await message.answer(f"Tasdiqlandi: user {user_id}, quiz {quiz_id}")
+    synced = await sync_premium_to_miniweb(user_id, True)
+    sync_note = "" if synced else "\n⚠️ Mini App sinxronlanmadi - /syncpremium bilan qo'lda urinib ko'ring."
+    await message.answer(f"Tasdiqlandi: user {user_id}, quiz {quiz_id}{sync_note}")
     await bot.send_message(
         user_id,
-        f"✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor.\n\n"
+        f"✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor "
+        f"— bot ichida ham, Mini App'da ham.\n\n"
         f"{TRUST_NOTE}",
         reply_markup=main_reply_keyboard(paid=True),
         parse_mode="HTML",
@@ -740,13 +773,38 @@ async def cmd_refund(message: Message, command: CommandObject):
         return
 
     db.refund_purchase(user_id, quiz_id)
-    await message.answer(f"✅ Pul qaytarildi deb belgilandi: user {user_id}, quiz {quiz_id}. Kirish huquqi bekor qilindi.")
+    synced = await sync_premium_to_miniweb(user_id, False)
+    sync_note = "" if synced else "\n⚠️ Mini App sinxronlanmadi - /syncpremium bilan qo'lda urinib ko'ring."
+    await message.answer(f"✅ Pul qaytarildi deb belgilandi: user {user_id}, quiz {quiz_id}. Kirish huquqi bekor qilindi.{sync_note}")
     await bot.send_message(
         user_id,
         "💸 Pulingiz to'liq qaytarildi.\n\n"
         "Agar kelajakda fikringiz o'zgarsa, botimiz doim tayyor turadi.\n\n"
         f"Savollaringiz bo'lsa, {config.SUPPORT_USERNAME} ga yozishingiz mumkin.",
     )
+
+
+@dp.message(Command("syncpremium"))
+async def cmd_syncpremium(message: Message, command: CommandObject):
+    """Manual fallback: /syncpremium <user_id> <on|off>
+    Use this if the automatic sync (shown after /confirm or /refund) failed -
+    e.g. the Mini App backend was briefly down when the payment was processed."""
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    if not command.args:
+        await message.answer("Foydalanish: /syncpremium <user_id> <on|off>")
+        return
+    parts = command.args.split()
+    if len(parts) != 2 or parts[1] not in ("on", "off"):
+        await message.answer("Foydalanish: /syncpremium <user_id> <on|off>")
+        return
+    user_id = int(parts[0])
+    is_premium = parts[1] == "on"
+    synced = await sync_premium_to_miniweb(user_id, is_premium)
+    if synced:
+        await message.answer(f"✅ Sinxronlandi: user {user_id} -> premium={is_premium}")
+    else:
+        await message.answer("❌ Sinxronlash muvaffaqiyatsiz. MINIWEB_ADMIN_URL / MINIWEB_ADMIN_KEY sozlamalarini tekshiring.")
 
 
 @dp.message(Command("pending"))

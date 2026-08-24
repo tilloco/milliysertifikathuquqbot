@@ -27,3 +27,11 @@ DB_PATH = os.getenv("DB_PATH", os.path.join(VOLUME_PATH, "lawquiz.db"))
 
 # One-time price for full access to ALL topics (not per-topic — a single payment unlocks everything).
 FULL_ACCESS_PRICE_UZS = int(os.getenv("FULL_ACCESS_PRICE_UZS", "12000"))
+
+# --- Mini App sync ---
+# When the admin confirms or refunds a payment here, the bot pings the Mini
+# App's backend so premium status stays in sync on both surfaces automatically.
+# MINIWEB_ADMIN_URL is the Mini App backend's base URL (no trailing slash).
+# MINIWEB_ADMIN_KEY must match the ADMIN_KEY set on that Render service.
+MINIWEB_ADMIN_URL = os.getenv("MINIWEB_ADMIN_URL", "https://telegram-mini-ai.onrender.com")
+MINIWEB_ADMIN_KEY = os.getenv("MINIWEB_ADMIN_KEY", "")

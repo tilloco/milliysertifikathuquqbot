@@ -55,3 +55,18 @@ WEAK_TOPIC_MIN_ANSWERS = int(os.getenv("WEAK_TOPIC_MIN_ANSWERS", "5"))
 
 # How many hours of inactivity before a user gets a "come back" reminder.
 INACTIVITY_REMINDER_HOURS = int(os.getenv("INACTIVITY_REMINDER_HOURS", "24"))
+
+# --- AI chat (free, general-purpose assistant button) ---
+# Get a free key at https://aistudio.google.com -> "Get API key". No card needed.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+# Check https://ai.google.dev/gemini-api/docs/models for the current free-tier
+# model name if this one ever stops working - Google renames/retires models
+# over time, so this is deliberately an env var you can update without a
+# code change.
+AI_MODEL = os.getenv("AI_MODEL", "gemini-2.0-flash")
+
+# Free for every user, but capped per day so one person can't burn through
+# your whole free quota and lock everyone else out. Raise/lower any time by
+# changing this variable on Railway - no redeploy of code needed.
+AI_DAILY_LIMIT = int(os.getenv("AI_DAILY_LIMIT", "20"))

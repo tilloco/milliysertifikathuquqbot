@@ -102,6 +102,10 @@ def init_db():
             db.execute("ALTER TABLE users ADD COLUMN last_active TEXT")
         if "last_reminder_sent" not in ucols:
             db.execute("ALTER TABLE users ADD COLUMN last_reminder_sent TEXT")
+        if "ai_messages_count" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN ai_messages_count INTEGER DEFAULT 0")
+        if "ai_messages_date" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN ai_messages_date TEXT")
 
         pcols = [r["name"] for r in db.execute("PRAGMA table_info(purchases)").fetchall()]
         if "price_uzs" not in pcols:
@@ -241,6 +245,61 @@ def mark_reminder_sent(telegram_id):
     now = datetime.datetime.utcnow().isoformat()
     with get_db() as db:
         db.execute("UPDATE users SET last_reminder_sent=? WHERE telegram_id=?", (now, telegram_id))
+
+
+# ---------- AI chat usage (free daily cap, shared across all users) ----------
+
+def get_ai_used_today(telegram_id):
+    today = datetime.date.today().isoformat()
+    with get_db() as db:
+        row = db.execute(
+            "SELECT ai_messages_count, ai_messages_date FROM users WHERE telegram_id=?",
+            (telegram_id,),
+        ).fetchone()
+        if not row or row["ai_messages_date"] != today:
+            return 0
+        return row["ai_messages_count"] or 0
+
+
+def ai_messages_remaining(telegram_id, limit):
+    return max(0, limit - get_ai_used_today(telegram_id))
+
+
+def record_ai_message(telegram_id):
+    today = datetime.date.today().isoformat()
+    with get_db() as db:
+        row = db.execute(
+            "SELECT ai_messages_count, ai_messages_date FROM users WHERE telegram_id=?",
+            (telegram_id,),
+        ).fetchone()
+        if not row or row["ai_messages_date"] != today:
+            db.execute(
+                "UPDATE users SET ai_messages_count=1, ai_messages_date=? WHERE telegram_id=?",
+                (today, telegram_id),
+            )
+        else:
+            db.execute(
+                "UPDATE users SET ai_messages_count=ai_messages_count+1 WHERE telegram_id=?",
+                (telegram_id,),
+            )
+
+
+def get_quiz_accuracy(user_id, quiz_id):
+    """Total answered / correct for this user in this quiz, across all
+    attempts (finished or not). Returns None if they haven't answered
+    anything here yet."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT COUNT(*) AS total, SUM(aa.is_correct) AS correct "
+            "FROM attempt_answers aa "
+            "JOIN attempts a ON a.id = aa.attempt_id "
+            "JOIN questions q ON q.id = aa.question_id "
+            "WHERE a.user_id=? AND q.quiz_id=?",
+            (user_id, quiz_id),
+        ).fetchone()
+        if not row or not row["total"]:
+            return None
+        return {"total": row["total"], "correct": row["correct"] or 0}
 
 
 # ---------- weak-topic analysis ----------

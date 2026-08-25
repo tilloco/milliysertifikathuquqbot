@@ -35,7 +35,16 @@ BTN_TESTLAR = "📝 Testlar"
 BTN_TAKLIF = "💡 Taklif-fikr"
 BTN_REYTING = "🏆 Reyting"
 BTN_TARIX = "🕐 Tarix"
+BTN_AI = "🤖 AI yordamchi"
 BTN_TOLOV = "💳 To'lov"
+
+AI_SYSTEM_PROMPT = (
+    "Siz talabalarga huquq fanidan DTM va milliy sertifikat imtihoniga tayyorlanishda "
+    "yordam beruvchi do'stona AI yordamchisiz. Savolga aniq va tushunarli o'zbek tilida "
+    "javob bering. Huquqiy mavzular bo'yicha alohida chuqur bilim bilan yordam bering, "
+    "lekin boshqa har qanday savolga ham (umumiy bilim, maslahat va h.k.) yordam berishga "
+    "tayyor bo'ling. Javobni juda uzun qilmang - Telegram xabari sifatida o'qish qulay bo'lsin."
+)
 
 # Shown wherever a buyer is deciding whether to pay - the guarantee and a
 # real person to ask reduce the "will I get scammed" hesitation that's the
@@ -94,6 +103,10 @@ class Feedback(StatesGroup):
     waiting_text = State()
 
 
+class AIChat(StatesGroup):
+    waiting_question = State()
+
+
 def parse_bulk_questions(text):
     """Parse a '===' separated block of questions into a list of dicts."""
     option_pattern = re.compile(r'^[A-D]\)\s*')
@@ -143,10 +156,45 @@ def main_reply_keyboard(paid=False):
         keyboard=[
             [KeyboardButton(text=BTN_TESTLAR), KeyboardButton(text=BTN_TAKLIF)],
             [KeyboardButton(text=BTN_REYTING), KeyboardButton(text=BTN_TARIX)],
-            [KeyboardButton(text=BTN_TOLOV)],
+            [KeyboardButton(text=BTN_AI), KeyboardButton(text=BTN_TOLOV)],
         ],
         resize_keyboard=True,
     )
+
+
+async def ask_gemini(question: str):
+    """Returns the AI's answer as text, or None if the call failed (missing
+    key, network error, bad response, etc.) - caller shows a friendly
+    fallback message in that case rather than crashing."""
+    if not config.GEMINI_API_KEY:
+        return None
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{config.AI_MODEL}:generateContent?key={config.GEMINI_API_KEY}"
+    )
+    payload = {
+        "contents": [
+            {"parts": [{"text": f"{AI_SYSTEM_PROMPT}\n\nSavol: {question}"}]}
+        ]
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logging.warning(f"Gemini API error ({resp.status}): {body}")
+                    return None
+                data = await resp.json()
+                try:
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                except (KeyError, IndexError, TypeError):
+                    logging.warning(f"Unexpected Gemini response shape: {data}")
+                    return None
+    except Exception as e:
+        logging.warning(f"Gemini API call failed: {e}")
+        return None
 
 
 def exam_countdown_line():
@@ -166,6 +214,15 @@ def exam_countdown_line():
         return "🔥 <b>BUGUN — Milliy sertifikat imtihoni kuni!</b>\n\n"
     word = "kun" if days_left != 1 else "kun"
     return f"⏳ <b>Milliy sertifikatgacha: {days_left} {word} qoldi!</b>\n\n"
+
+
+def progress_bar(done, total, length=10):
+    """Renders a filled/empty block bar, e.g. ▰▰▰▰▱▱▱▱▱▱ for 4/10."""
+    if total <= 0:
+        return "▱" * length
+    filled = round(length * done / total)
+    filled = max(0, min(length, filled))
+    return "▰" * filled + "▱" * (length - filled)
 
 
 def weak_topic_line(user_id):
@@ -265,15 +322,41 @@ async def send_history(chat_id, user_id):
     if not quizzes:
         await bot.send_message(chat_id, "Hozircha testlar mavjud emas.")
         return
-    lines = ["🕐 <b>Sizning tarixingiz</b>\n"]
+
+    lines = ["🕐 <b>Sizning tarixingiz</b>", ""]
     total_done, total_all = 0, 0
+    total_correct, total_answered = 0, 0
+    any_progress = False
+
     for q in quizzes:
         total_modules = db.count_modules(q["id"])
         completed = db.get_completed_modules(user_id, q["id"])
-        total_done += len(completed)
+        done = len(completed)
+        total_done += done
         total_all += total_modules
-        lines.append(f"{q['title']}: {len(completed)}/{total_modules} test ishlangan")
-    lines.append(f"\nJami: {total_done}/{total_all} test yakunlangan")
+
+        lines.append(f"📘 <b>{q['title']}</b>")
+        lines.append(f"{progress_bar(done, total_modules)}  {done}/{total_modules} test")
+
+        acc = db.get_quiz_accuracy(user_id, q["id"])
+        if acc:
+            any_progress = True
+            pct = int(100 * acc["correct"] / acc["total"])
+            lines.append(f"✅ To'g'ri javoblar: {acc['correct']}/{acc['total']} ({pct}%)")
+            total_correct += acc["correct"]
+            total_answered += acc["total"]
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("📊 <b>Umumiy natija</b>")
+    lines.append(f"{progress_bar(total_done, total_all)}  {total_done}/{total_all} test yakunlangan")
+    if total_answered:
+        overall_pct = int(100 * total_correct / total_answered)
+        lines.append(f"🎯 Aniqlik: {total_correct}/{total_answered} to'g'ri ({overall_pct}%)")
+
+    if not any_progress:
+        lines.append("\nHali birorta savol yechmadingiz. \"📝 Testlar\" tugmasini bosib boshlang!")
+
     await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
@@ -407,7 +490,8 @@ async def cmd_start(message: Message, command: CommandObject):
 
 
 @dp.message(F.text == BTN_TESTLAR)
-async def on_testlar_pressed(message: Message):
+async def on_testlar_pressed(message: Message, state: FSMContext):
+    await state.clear()
     quizzes = db.list_quizzes()
     if not quizzes:
         await message.answer("Hozircha testlar mavjud emas. Tez orada qo'shiladi!")
@@ -416,12 +500,14 @@ async def on_testlar_pressed(message: Message):
 
 
 @dp.message(F.text == BTN_REYTING)
-async def on_reyting_button(message: Message):
+async def on_reyting_button(message: Message, state: FSMContext):
+    await state.clear()
     await send_leaderboard(message.chat.id)
 
 
 @dp.message(F.text == BTN_TARIX)
-async def on_tarix_button(message: Message):
+async def on_tarix_button(message: Message, state: FSMContext):
+    await state.clear()
     await send_history(message.chat.id, message.from_user.id)
 
 
@@ -452,11 +538,80 @@ async def on_feedback_received(message: Message, state: FSMContext):
     await message.answer("Rahmat! Fikringiz uchun rahmat 🙏 Botni yanada yaxshilashda albatta hisobga olamiz.")
 
 
+@dp.message(F.text == BTN_AI)
+async def on_ai_button(message: Message, state: FSMContext):
+    if not config.GEMINI_API_KEY:
+        await message.answer(
+            "🤖 AI yordamchi hozircha sozlanmoqda. Tez orada ishga tushadi!"
+        )
+        return
+    remaining = db.ai_messages_remaining(message.from_user.id, config.AI_DAILY_LIMIT)
+    if remaining <= 0:
+        await message.answer(
+            f"🤖 Bugungi {config.AI_DAILY_LIMIT} ta AI savolingiz tugadi. "
+            f"Ertaga qayta urinib ko'ring!"
+        )
+        return
+    await state.set_state(AIChat.waiting_question)
+    await message.answer(
+        f"🤖 <b>AI yordamchi</b>\n\n"
+        f"Istalgan savolingizni yozing — huquq fanidan ham, boshqa mavzudan ham "
+        f"yordam bera olaman.\n\n"
+        f"Bugun yana <b>{remaining}</b> ta savol so'rashingiz mumkin.",
+        parse_mode="HTML",
+    )
+
+
+_MENU_BUTTON_TEXTS = {BTN_TESTLAR, BTN_TAKLIF, BTN_REYTING, BTN_TARIX, BTN_AI, BTN_TOLOV}
+
+
+@dp.message(StateFilter(AIChat.waiting_question), ~F.text.in_(_MENU_BUTTON_TEXTS))
+async def on_ai_question(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Iltimos, savolingizni matn ko'rinishida yozing.")
+        return
+
+    user_id = message.from_user.id
+    remaining = db.ai_messages_remaining(user_id, config.AI_DAILY_LIMIT)
+    if remaining <= 0:
+        await state.clear()
+        await message.answer(
+            f"🤖 Bugungi {config.AI_DAILY_LIMIT} ta AI savolingiz tugadi. "
+            f"Ertaga qayta urinib ko'ring!"
+        )
+        return
+
+    thinking = await message.answer("🤖 O'ylayapman...")
+    answer = await ask_gemini(message.text)
+    db.record_ai_message(user_id)
+
+    if answer is None:
+        await thinking.edit_text(
+            "Kechirasiz, hozir javob bera olmadim. Birozdan so'ng qayta urinib ko'ring."
+        )
+        return
+
+    remaining_after = db.ai_messages_remaining(user_id, config.AI_DAILY_LIMIT)
+    try:
+        await thinking.edit_text(
+            f"{answer}\n\n<i>Qolgan savollar bugun: {remaining_after}</i>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        await message.answer(
+            f"{answer}\n\n<i>Qolgan savollar bugun: {remaining_after}</i>",
+            parse_mode="HTML",
+        )
+    # Stay in AIChat.waiting_question so the user can keep asking follow-ups
+    # without pressing the button again each time.
+
+
 @dp.message(F.text == BTN_TOLOV)
-async def on_tolov_button(message: Message):
+async def on_tolov_button(message: Message, state: FSMContext):
     """Always shows the payment details first, then the current payment status
     right under it - every single time this button is pressed, no matter how
     many times, and no matter whether a screenshot was ever sent."""
+    await state.clear()
     user_id = message.from_user.id
 
     if db.has_any_confirmed_purchase(user_id):

@@ -257,6 +257,8 @@ async def send_assessment_result(chat_id, user_id, attempt_id):
         await bot.send_message(chat_id, "Natijani hisoblab bo'lmadi. Qaytadan urinib ko'ring.")
         return
 
+    thinking = await bot.send_message(chat_id, "🧠 Natijalaringiz tahlil qilinmoqda...")
+
     total = sum(row["total"] for row in breakdown)
     correct = sum(row["correct"] or 0 for row in breakdown)
     pct = int(100 * correct / total) if total else 0
@@ -264,9 +266,11 @@ async def send_assessment_result(chat_id, user_id, attempt_id):
     db.set_level(user_id, level_code)
 
     lines = [
-        "📊 <b>Darajani aniqlash natijasi</b>\n",
-        f"Umumiy natija: <b>{correct}/{total}</b> ({pct}%)",
-        f"Darajangiz: <b>{LEVEL_LABELS[level_code]}</b>\n",
+        "📊 <b>Darajani aniqlash natijasi</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"✅ Umumiy natija: <b>{correct}/{total}</b> ({pct}%)",
+        f"🏅 Darajangiz: <b>{LEVEL_LABELS[level_code]}</b>",
+        "",
         "📉 <b>Sohalar bo'yicha tahlil:</b>",
     ]
     for row in breakdown:
@@ -277,12 +281,19 @@ async def send_assessment_result(chat_id, user_id, attempt_id):
     weakest = breakdown[0]
     if weakest["total"]:
         weakest_pct = int(100 * (weakest["correct"] or 0) / weakest["total"])
+        lines.append("━━━━━━━━━━━━━━━━━━")
         lines.append(
-            f"\n🎯 <b>Eng zaif tomoningiz:</b> {weakest['tag']} ({weakest_pct}%). "
-            f"Shu sohaga ko'proq e'tibor bering!"
+            f"🎯 <b>Eng zaif tomoningiz:</b> {weakest['tag']} ({weakest_pct}%)\n"
+            f"Tavsiya: shu sohadagi testlarni birinchi navbatda ishlang — "
+            f"aynan shu yer sizni eng ko'p yiqitadi!"
         )
 
-    await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+    try:
+        await thinking.edit_text("\n".join(lines), parse_mode="HTML")
+    except Exception:
+        await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+
+    await bot.send_message(chat_id, "Endi asosiy menyudan davom etishingiz mumkin 👇")
     await send_welcome_menu(chat_id, user_id)
 
 
@@ -293,13 +304,16 @@ async def offer_assessment(chat_id, state: FSMContext):
     if not assessment:
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📊 Darajani aniqlash testini boshlash", callback_data=f"startassess:{assessment['id']}")
+        InlineKeyboardButton(text="🚀 Darajamni hoziroq bilib olaman", callback_data=f"startassess:{assessment['id']}")
     ]])
     await bot.send_message(
         chat_id,
-        "Xohlasangiz, 15 ta savoldan iborat qisqa test orqali hozirgi bilim "
-        "darajangizni va eng zaif tomoningizni aniqlab olishingiz mumkin 👇",
+        "🎯 <b>Eng birinchi qadam</b>\n\n"
+        "15 ta savoldan iborat qisqa test orqali hozirgi bilim darajangizni "
+        "va eng zaif tomoningizni aniqlab olamiz — shundan keyin qayerdan "
+        "boshlashni aniq bilasiz 👇",
         reply_markup=kb,
+        parse_mode="HTML",
     )
 
 
@@ -992,7 +1006,10 @@ async def on_daily_answer(callback: CallbackQuery):
     result_text += "\n\nErtaga yana bepul savol oling! Barcha testlarni ko'rish uchun /start bosing."
 
     try:
-        await callback.message.edit_text(result_text, parse_mode="HTML")
+        await callback.message.edit_text(
+            result_text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[]),
+        )
     except Exception:
         await callback.message.answer(result_text, parse_mode="HTML")
 
@@ -1189,9 +1206,15 @@ async def on_answer(callback: CallbackQuery):
         result_text += f"\nℹ️ <b>Izoh:</b>\n<blockquote>{q['explanation']}</blockquote>"
 
     # Edit the question in place instead of sending a new message - this
-    # doesn't fire a fresh notification the way a new message does.
+    # doesn't fire a fresh notification the way a new message does. Passing
+    # an explicit empty keyboard clears the old answer-choice buttons -
+    # edit_text alone leaves stale buttons attached (unlike edit_reply_markup,
+    # which Telegram clears by default when called with no markup).
     try:
-        await callback.message.edit_text(result_text, parse_mode="HTML")
+        await callback.message.edit_text(
+            result_text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[]),
+        )
     except Exception:
         await callback.message.answer(result_text, parse_mode="HTML")
 

@@ -1,5 +1,7 @@
 import asyncio
+import datetime
 import logging
+import random
 import re
 
 import aiohttp
@@ -12,10 +14,12 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    TelegramObject,
 )
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
 import database as db
@@ -41,6 +45,14 @@ TRUST_NOTE = (
     f"biron sababga ko'ra qoniqmasangiz — pulingiz to'liq va so'zsiz qaytariladi.\n"
     f"❓ Savollar uchun: {config.SUPPORT_USERNAME}"
 )
+
+# Rotated in the 24h-inactivity reminder so it doesn't feel like a copy-paste bot message.
+MOTIVATIONAL_LINES = [
+    "Maqsadlar harakat bilan zafar topadi. Bugun yana bir qadam tashla! 💪",
+    "Har kuni 10 daqiqa — imtihon kunida katta farq qiladi. Davom etaylik!",
+    "Bilim — eng ishonchli sarmoya. Bugun ozgina vaqt ajrat!",
+    "Kichik qadamlar katta natijalarga olib keladi. Hoziroq boshla!",
+]
 
 
 async def sync_premium_to_miniweb(telegram_id: int, is_premium: bool) -> bool:
@@ -134,6 +146,40 @@ def main_reply_keyboard(paid=False):
             [KeyboardButton(text=BTN_TOLOV)],
         ],
         resize_keyboard=True,
+    )
+
+
+def exam_countdown_line():
+    """Big banner shown at the top of /start. Returns '' if EXAM_DATE isn't
+    configured yet or is invalid/in the past, so nothing breaks if you haven't
+    set it."""
+    if not config.EXAM_DATE:
+        return ""
+    try:
+        exam_date = datetime.date.fromisoformat(config.EXAM_DATE)
+    except ValueError:
+        return ""
+    days_left = (exam_date - datetime.date.today()).days
+    if days_left < 0:
+        return ""
+    if days_left == 0:
+        return "🔥 <b>BUGUN — Milliy sertifikat imtihoni kuni!</b>\n\n"
+    word = "kun" if days_left != 1 else "kun"
+    return f"⏳ <b>Milliy sertifikatgacha: {days_left} {word} qoldi!</b>\n\n"
+
+
+def weak_topic_line(user_id):
+    """One or two lines pointing the user at their weakest topic, or '' if we
+    don't yet have enough answered questions to be confident about it."""
+    weak = db.get_weak_topic(user_id, min_answers=config.WEAK_TOPIC_MIN_ANSWERS)
+    if not weak or not weak["total"]:
+        return ""
+    correct = weak["correct"] or 0
+    pct = int(100 * correct / weak["total"])
+    return (
+        f"📉 <b>Tahlil:</b> \"{weak['title']}\" mavzusida siz hozircha {pct}% to'g'ri "
+        f"javob berdingiz — bu sizning eng zaif mavzungiz. Aynan shu yerga ko'proq "
+        f"e'tibor bering!\n\n"
     )
 
 
@@ -257,6 +303,7 @@ async def send_daily_limit_prompt(chat_id, quiz, user_id):
     await bot.send_message(
         chat_id,
         f"🎯 Bugungi {db.DAILY_FREE_LIMIT} ta bepul savolingiz tugadi!\n\n"
+        f"{weak_topic_line(user_id)}"
         f"Ertaga yana {db.DAILY_FREE_LIMIT} ta bepul savolga ega bo'lasiz — yoki hoziroq bir martalik "
         f"to'lov bilan <b>barcha mavzulardagi cheksiz testlarga</b> umrbod kirish huquqiga ega bo'ling. "
         f"DTM va milliy sertifikatga eng qulay tayyorgarlik yo'li! 🚀\n\n"
@@ -318,6 +365,26 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
     )
 
 
+# ---------------- activity tracking middleware ----------------
+
+class ActivityMiddleware:
+    """Stamps last_active on every incoming message/callback, so the 24h
+    inactivity-reminder job knows who's gone quiet."""
+
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        user = None
+        if getattr(event, "message", None) is not None:
+            user = event.message.from_user
+        elif getattr(event, "callback_query", None) is not None:
+            user = event.callback_query.from_user
+        if user is not None:
+            db.touch_last_active(user.id)
+        return await handler(event, data)
+
+
+dp.update.outer_middleware(ActivityMiddleware())
+
+
 # ---------------- user commands ----------------
 
 @dp.message(Command("start"))
@@ -330,10 +397,12 @@ async def cmd_start(message: Message, command: CommandObject):
     db.upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, referred_by)
     paid = db.has_any_confirmed_purchase(message.from_user.id)
     await message.answer(
+        f"{exam_countdown_line()}"
         "Assalomu alaykum! 👋\n\n"
         "Huquq fanidan testlar shu yerda. Pastdagi menyudan foydalaning 👇\n\n"
         "🏆 Har oy TOP-3 faolga pul bonusi!",
         reply_markup=main_reply_keyboard(paid=paid),
+        parse_mode="HTML",
     )
 
 
@@ -467,7 +536,6 @@ async def cmd_referral(message: Message):
 
 @dp.message(Command("kunlik"))
 async def cmd_daily(message: Message):
-    import datetime
     today = datetime.date.today().isoformat()
     last = db.get_last_daily_date(message.from_user.id)
     if last == today:
@@ -715,6 +783,61 @@ async def on_answer(callback: CallbackQuery):
         # attempt just got marked finished mid-flight in edge cases
         return
     await send_question(callback.message.chat.id, quiz_id, updated_attempt, user_id)
+
+
+# ---------------- inactivity reminders (background job) ----------------
+
+async def send_inactivity_reminders():
+    """Runs periodically (see scheduler setup in main()). Pings any user whose
+    last activity crossed config.INACTIVITY_REMINDER_HOURS and who hasn't
+    already been reminded since then."""
+    inactive_ids = db.get_inactive_users(hours=config.INACTIVITY_REMINDER_HOURS)
+    for telegram_id in inactive_ids:
+        line = random.choice(MOTIVATIONAL_LINES)
+        try:
+            await bot.send_message(
+                telegram_id,
+                f"👋 Sizni sog'indik!\n\n{line}\n\nDavom etish uchun pastdagi \"📝 Testlar\" tugmasini bosing yoki /start yozing.",
+            )
+            db.mark_reminder_sent(telegram_id)
+        except Exception as e:
+            # Most common cause: user blocked the bot. Mark as reminded anyway
+            # so we don't retry them every hour forever.
+            logging.warning(f"Inactivity reminder failed for {telegram_id}: {e}")
+            db.mark_reminder_sent(telegram_id)
+
+
+# ---------------- admin: channel stats ----------------
+
+@dp.message(Command("postchannel"))
+async def cmd_postchannel(message: Message):
+    """Posts a short usage snapshot to config.STATS_CHANNEL_ID - run this
+    manually whenever you want to refresh the numbers shown in your info
+    channel (e.g. once a day)."""
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    if not config.STATS_CHANNEL_ID:
+        await message.answer(
+            "STATS_CHANNEL_ID sozlanmagan.\n\n"
+            "1) Kanal yarating, botni admin qiling.\n"
+            "2) Railway'da STATS_CHANNEL_ID environment variable'ini kanal ID "
+            "(-100 bilan boshlanadi) yoki @username bilan to'ldiring."
+        )
+        return
+    total_users = db.count_users()
+    by_status = db.count_purchases_by_status()
+    paid_count = by_status.get("confirmed", 0)
+    text = (
+        "📊 <b>Bot statistikasi</b>\n\n"
+        f"👥 Jami foydalanuvchilar: <b>{total_users}</b>\n"
+        f"✅ Premium foydalanuvchilar: <b>{paid_count}</b>\n\n"
+        "Har kuni yangilanadi. Botga qo'shilib, bepul savollarni sinab ko'ring! 🚀"
+    )
+    try:
+        await bot.send_message(config.STATS_CHANNEL_ID, text, parse_mode="HTML")
+        await message.answer("✅ Kanalga yuborildi.")
+    except Exception as e:
+        await message.answer(f"❌ Xatolik: {e}\n\nBot kanalda admin ekanligini tekshiring.")
 
 
 # ---------------- admin commands ----------------
@@ -1128,6 +1251,14 @@ async def addq_got_explanation(message: Message, state: FSMContext):
 
 async def main():
     db.init_db()
+
+    scheduler = AsyncIOScheduler()
+    # Checked hourly; a user only gets pinged once per inactivity crossing
+    # (see get_inactive_users), so an hourly check just controls how soon
+    # after the 24h mark they hear from us - not how often they're pinged.
+    scheduler.add_job(send_inactivity_reminders, "interval", hours=1)
+    scheduler.start()
+
     await dp.start_polling(bot)
 
 

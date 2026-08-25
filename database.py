@@ -98,6 +98,10 @@ def init_db():
             db.execute("ALTER TABLE users ADD COLUMN free_answers_count INTEGER DEFAULT 0")
         if "free_answers_date" not in ucols:
             db.execute("ALTER TABLE users ADD COLUMN free_answers_date TEXT")
+        if "last_active" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN last_active TEXT")
+        if "last_reminder_sent" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN last_reminder_sent TEXT")
 
         pcols = [r["name"] for r in db.execute("PRAGMA table_info(purchases)").fetchall()]
         if "price_uzs" not in pcols:
@@ -205,6 +209,64 @@ def get_question_by_id(question_id):
         d = dict(row)
         d["options"] = json.loads(d["options"])
         return d
+
+
+# ---------- activity tracking (for 24h inactivity reminders) ----------
+
+def touch_last_active(telegram_id):
+    """Call on every incoming message/callback from a user. Only updates
+    existing users - if upsert_user hasn't run yet for this id this is a
+    harmless no-op (cmd_start always runs upsert_user first anyway)."""
+    now = datetime.datetime.utcnow().isoformat()
+    with get_db() as db:
+        db.execute("UPDATE users SET last_active=? WHERE telegram_id=?", (now, telegram_id))
+
+
+def get_inactive_users(hours=24):
+    """Telegram IDs whose last activity was at least `hours` ago AND who
+    haven't already been reminded since that last-active moment (so we don't
+    spam the same user every hour once they cross the threshold)."""
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(hours=hours)).isoformat()
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT telegram_id FROM users "
+            "WHERE last_active IS NOT NULL AND last_active <= ? "
+            "AND (last_reminder_sent IS NULL OR last_reminder_sent < last_active)",
+            (cutoff,),
+        ).fetchall()
+        return [r["telegram_id"] for r in rows]
+
+
+def mark_reminder_sent(telegram_id):
+    now = datetime.datetime.utcnow().isoformat()
+    with get_db() as db:
+        db.execute("UPDATE users SET last_reminder_sent=? WHERE telegram_id=?", (now, telegram_id))
+
+
+# ---------- weak-topic analysis ----------
+
+def get_weak_topic(user_id, min_answers=5):
+    """Among topics this user has actually answered questions in, returns the
+    one with the lowest accuracy (as a dict with quiz_id/title/total/correct),
+    or None if no topic yet has at least `min_answers` answered questions."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT qz.id AS quiz_id, qz.title AS title, "
+            "COUNT(*) AS total, SUM(aa.is_correct) AS correct "
+            "FROM attempt_answers aa "
+            "JOIN attempts a ON a.id = aa.attempt_id "
+            "JOIN questions q ON q.id = aa.question_id "
+            "JOIN quizzes qz ON qz.id = q.quiz_id "
+            "WHERE a.user_id=? "
+            "GROUP BY qz.id "
+            "HAVING total >= ? "
+            "ORDER BY (CAST(correct AS FLOAT) / total) ASC "
+            "LIMIT 1",
+            (user_id, min_answers),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
 
 
 # ---------- analytics ----------

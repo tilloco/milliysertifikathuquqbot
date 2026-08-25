@@ -35,3 +35,23 @@ FULL_ACCESS_PRICE_UZS = int(os.getenv("FULL_ACCESS_PRICE_UZS", "12000"))
 # MINIWEB_ADMIN_KEY must match the ADMIN_KEY set on that Render service.
 MINIWEB_ADMIN_URL = os.getenv("MINIWEB_ADMIN_URL", "https://telegram-mini-ai.onrender.com")
 MINIWEB_ADMIN_KEY = os.getenv("MINIWEB_ADMIN_KEY", "")
+
+# --- Exam countdown ---
+# Date of the "milliy sertifikat" exam, shown as a big countdown on /start.
+# Format: YYYY-MM-DD (e.g. "2026-12-15"). Leave blank to hide the countdown
+# until you know/decide the date.
+EXAM_DATE = os.getenv("EXAM_DATE", "")
+
+# --- Public stats channel ---
+# Telegram channel where you post live usage numbers (e.g. "N ta talaba
+# foydalanmoqda") to build trust. Add the bot as admin of that channel first,
+# then set this to the channel's numeric ID (starts with -100...) or its
+# @username. Leave blank to disable /postchannel.
+STATS_CHANNEL_ID = os.getenv("STATS_CHANNEL_ID", "")
+
+# Minimum number of answered questions in a topic before we're confident
+# enough to call it the user's "weak topic" and recommend it.
+WEAK_TOPIC_MIN_ANSWERS = int(os.getenv("WEAK_TOPIC_MIN_ANSWERS", "5"))
+
+# How many hours of inactivity before a user gets a "come back" reminder.
+INACTIVITY_REMINDER_HOURS = int(os.getenv("INACTIVITY_REMINDER_HOURS", "24"))

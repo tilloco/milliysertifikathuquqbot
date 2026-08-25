@@ -110,6 +110,12 @@ def init_db():
             db.execute("ALTER TABLE users ADD COLUMN learn_reason TEXT")
         if "birth_year" not in ucols:
             db.execute("ALTER TABLE users ADD COLUMN birth_year INTEGER")
+        if "onboarding_name" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN onboarding_name TEXT")
+        if "target_grade" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN target_grade TEXT")
+        if "prep_time" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN prep_time TEXT")
         if "level" not in ucols:
             db.execute("ALTER TABLE users ADD COLUMN level TEXT")
         if "onboarding_done" not in ucols:
@@ -273,14 +279,24 @@ def has_completed_onboarding(telegram_id):
         return bool(row and row["onboarding_done"])
 
 
+def set_onboarding_name(telegram_id, name):
+    with get_db() as db:
+        db.execute("UPDATE users SET onboarding_name=? WHERE telegram_id=?", (name, telegram_id))
+
+
 def set_learn_reason(telegram_id, reason):
     with get_db() as db:
         db.execute("UPDATE users SET learn_reason=? WHERE telegram_id=?", (reason, telegram_id))
 
 
-def set_birth_year(telegram_id, year):
+def set_target_grade(telegram_id, grade):
     with get_db() as db:
-        db.execute("UPDATE users SET birth_year=? WHERE telegram_id=?", (year, telegram_id))
+        db.execute("UPDATE users SET target_grade=? WHERE telegram_id=?", (grade, telegram_id))
+
+
+def set_prep_time(telegram_id, prep_time):
+    with get_db() as db:
+        db.execute("UPDATE users SET prep_time=? WHERE telegram_id=?", (prep_time, telegram_id))
 
 
 def set_level(telegram_id, level):
@@ -748,8 +764,8 @@ def reset_user_onboarding(user_id):
     """Admin/testing helper: clears the onboarding survey so /start shows it again."""
     with get_db() as db:
         db.execute(
-            "UPDATE users SET onboarding_done=0, learn_reason=NULL, birth_year=NULL, level=NULL "
-            "WHERE telegram_id=?",
+            "UPDATE users SET onboarding_done=0, onboarding_name=NULL, learn_reason=NULL, "
+            "target_grade=NULL, level=NULL, prep_time=NULL WHERE telegram_id=?",
             (user_id,),
         )
 

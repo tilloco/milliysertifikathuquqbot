@@ -108,9 +108,11 @@ class AIChat(StatesGroup):
 
 
 class Onboarding(StatesGroup):
+    waiting_name = State()
     waiting_reason = State()
-    waiting_birth_year = State()
+    waiting_target = State()
     waiting_level = State()
+    waiting_time = State()
 
 
 def parse_bulk_questions(text):
@@ -238,12 +240,12 @@ def progress_bar(done, total, length=10):
     return "▰" * filled + "▱" * (length - filled)
 
 
-LEVEL_LABELS = {"boshlangich": "🟢 Boshlang'ich", "orta": "🟡 O'rta", "yuqori": "🔴 Yuqori"}
+LEVEL_LABELS = {"boshlangich": "🟢 Boshlang'ich", "orta": "🟡 O'rta", "expert": "🔴 Expert"}
 
 
 def compute_level(pct):
     if pct >= 80:
-        return "yuqori"
+        return "expert"
     if pct >= 50:
         return "orta"
     return "boshlangich"
@@ -317,16 +319,28 @@ async def on_start_assessment(callback: CallbackQuery):
 
 
 LEARN_REASON_OPTIONS = [
-    ("dtm", "📚 DTM imtihoniga tayyorgarlik"),
-    ("sertifikat", "🎓 Milliy sertifikat uchun"),
-    ("kasb", "💼 Kasbim/ishim uchun kerak"),
-    ("qiziqish", "🤔 Shunchaki qiziqaman"),
+    ("soham", "💼 Soham (mutaxassisligim/kasbim)"),
+    ("qiziqish", "🤔 Qiziqaman, kerak bo'ladi"),
+]
+
+TARGET_GRADE_OPTIONS = [
+    ("c", "C"),
+    ("b", "B"),
+    ("a", "A"),
+    ("aplus", "A+"),
 ]
 
 LEVEL_OPTIONS = [
     ("boshlangich", "🟢 Boshlang'ich"),
     ("orta", "🟡 O'rta"),
-    ("yuqori", "🔴 Yuqori"),
+    ("expert", "🔴 Expert"),
+]
+
+PREP_TIME_OPTIONS = [
+    ("1oy", "1 oy"),
+    ("2oy", "2 oy"),
+    ("4oy", "4 oy"),
+    ("6oyplus", "6 oy+"),
 ]
 
 
@@ -337,6 +351,13 @@ def onboarding_reason_keyboard():
     return kb
 
 
+def onboarding_target_keyboard():
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for code, label in TARGET_GRADE_OPTIONS:
+        kb.inline_keyboard.append([InlineKeyboardButton(text=label, callback_data=f"onbtarget:{code}")])
+    return kb
+
+
 def onboarding_level_keyboard():
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for code, label in LEVEL_OPTIONS:
@@ -344,20 +365,17 @@ def onboarding_level_keyboard():
     return kb
 
 
-def onboarding_year_skip_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="O'tkazib yuborish", callback_data="onbyear:skip")
-    ]])
+def onboarding_time_keyboard():
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for code, label in PREP_TIME_OPTIONS:
+        kb.inline_keyboard.append([InlineKeyboardButton(text=label, callback_data=f"onbtime:{code}")])
+    return kb
 
 
 async def start_onboarding(chat_id, state: FSMContext):
-    await state.set_state(Onboarding.waiting_reason)
-    await bot.send_message(chat_id, "Xush kelibsiz! Sizni yaxshiroq tushunish uchun 3 ta qisqa savol 👇")
-    await bot.send_message(
-        chat_id,
-        "1️⃣ Nima uchun huquq fanini o'rganyapsiz?",
-        reply_markup=onboarding_reason_keyboard(),
-    )
+    await state.set_state(Onboarding.waiting_name)
+    await bot.send_message(chat_id, "Xush kelibsiz! Sizni yaxshiroq tushunish uchun 5 ta qisqa savol 👇")
+    await bot.send_message(chat_id, "1️⃣ Ismingiz?")
 
 
 async def send_welcome_menu(chat_id, user_id):
@@ -644,49 +662,47 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
     await send_welcome_menu(message.chat.id, message.from_user.id)
 
 
+@dp.message(StateFilter(Onboarding.waiting_name))
+async def on_onboarding_name(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Iltimos, ismingizni matn ko'rinishida yozing.")
+        return
+    db.set_onboarding_name(message.from_user.id, name[:100])
+    await state.set_state(Onboarding.waiting_reason)
+    await message.answer(
+        f"Rahmat, {name}! 2️⃣ Huquqni nima uchun o'rganyapsiz?",
+        reply_markup=onboarding_reason_keyboard(),
+    )
+
+
 @dp.callback_query(F.data.startswith("onbreason:"))
 async def on_onboarding_reason(callback: CallbackQuery, state: FSMContext):
     code = callback.data.split(":", 1)[1]
     db.set_learn_reason(callback.from_user.id, code)
-    await state.set_state(Onboarding.waiting_birth_year)
+    await state.set_state(Onboarding.waiting_target)
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
     await callback.message.answer(
-        "2️⃣ Tug'ilgan yilingiz? (masalan: 2005)",
-        reply_markup=onboarding_year_skip_keyboard(),
+        "3️⃣ Milliy sertifikat bo'yicha maqsadingiz?",
+        reply_markup=onboarding_target_keyboard(),
     )
     await callback.answer()
 
 
-@dp.message(StateFilter(Onboarding.waiting_birth_year))
-async def on_onboarding_birth_year(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-    current_year = datetime.date.today().year
-    if not text.isdigit() or not (current_year - 100 <= int(text) <= current_year - 5):
-        await message.answer(
-            "Iltimos, to'g'ri yilni raqamda yuboring (masalan: 2005), "
-            "yoki yuqoridagi tugma orqali o'tkazib yuboring."
-        )
-        return
-    db.set_birth_year(message.from_user.id, int(text))
-    await state.set_state(Onboarding.waiting_level)
-    await message.answer(
-        "3️⃣ Huquq fanidan hozirgi bilim darajangiz qanday?",
-        reply_markup=onboarding_level_keyboard(),
-    )
-
-
-@dp.callback_query(F.data == "onbyear:skip")
-async def on_onboarding_year_skip(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data.startswith("onbtarget:"))
+async def on_onboarding_target(callback: CallbackQuery, state: FSMContext):
+    code = callback.data.split(":", 1)[1]
+    db.set_target_grade(callback.from_user.id, code)
     await state.set_state(Onboarding.waiting_level)
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
     await callback.message.answer(
-        "3️⃣ Huquq fanidan hozirgi bilim darajangiz qanday?",
+        "4️⃣ Huquq fanidan hozirgi bilim darajangiz qanday?",
         reply_markup=onboarding_level_keyboard(),
     )
     await callback.answer()
@@ -696,6 +712,22 @@ async def on_onboarding_year_skip(callback: CallbackQuery, state: FSMContext):
 async def on_onboarding_level(callback: CallbackQuery, state: FSMContext):
     code = callback.data.split(":", 1)[1]
     db.set_level(callback.from_user.id, code)
+    await state.set_state(Onboarding.waiting_time)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(
+        "5️⃣ Tayyorgarlik uchun qancha vaqtingiz bor?",
+        reply_markup=onboarding_time_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("onbtime:"))
+async def on_onboarding_time(callback: CallbackQuery, state: FSMContext):
+    code = callback.data.split(":", 1)[1]
+    db.set_prep_time(callback.from_user.id, code)
     db.mark_onboarding_done(callback.from_user.id)
     await state.clear()
     try:

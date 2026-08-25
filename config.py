@@ -15,6 +15,14 @@ PAYMENT_INSTRUCTIONS = os.getenv(
     "To'lovdan so'ng screenshot yuboring, biz tasdiqlaymiz."
 )
 
+# Optional: set these to show the card number as a tap-to-copy code block
+# instead of plain text buried inside PAYMENT_INSTRUCTIONS (much easier to
+# copy on mobile). If CARD_NUMBER is left blank, the bot falls back to
+# showing PAYMENT_INSTRUCTIONS as-is (not copyable), so nothing breaks if
+# you don't set these.
+CARD_NUMBER = os.getenv("CARD_NUMBER", "")
+CARD_HOLDER_NAME = os.getenv("CARD_HOLDER_NAME", "")
+
 # Shown next to payment info and the daily-limit paywall, for trust and support questions.
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@xakimov_63")
 
@@ -66,7 +74,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # code change.
 AI_MODEL = os.getenv("AI_MODEL", "gemini-2.0-flash")
 
-# Free for every user, but capped per day so one person can't burn through
-# your whole free quota and lock everyone else out. Raise/lower any time by
-# changing this variable on Railway - no redeploy of code needed.
-AI_DAILY_LIMIT = int(os.getenv("AI_DAILY_LIMIT", "20"))
+# Free questions per user - LIFETIME total, not per day. After this many,
+# the AI button redirects to the payment flow instead of answering (the
+# remaining count is never shown to free users - they just see the paywall
+# once they hit it). Paid/premium users are always unlimited. Change this
+# anytime on Railway without a redeploy.
+AI_DAILY_LIMIT = int(os.getenv("AI_DAILY_LIMIT", "5"))

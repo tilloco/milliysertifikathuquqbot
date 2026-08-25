@@ -309,41 +309,27 @@ def mark_onboarding_done(telegram_id):
         db.execute("UPDATE users SET onboarding_done=1 WHERE telegram_id=?", (telegram_id,))
 
 
-# ---------- AI chat usage (free daily cap, shared across all users) ----------
+# ---------- AI chat usage (free LIFETIME cap per user, unlimited for premium) ----------
 
-def get_ai_used_today(telegram_id):
-    today = datetime.date.today().isoformat()
+def get_ai_total_used(telegram_id):
+    """Lifetime count of AI messages this user has sent - not reset daily.
+    ai_messages_date is unused now (kept in the schema for old rows) since
+    the free cap is a one-time total, not a daily allowance."""
     with get_db() as db:
         row = db.execute(
-            "SELECT ai_messages_count, ai_messages_date FROM users WHERE telegram_id=?",
+            "SELECT ai_messages_count FROM users WHERE telegram_id=?",
             (telegram_id,),
         ).fetchone()
-        if not row or row["ai_messages_date"] != today:
-            return 0
-        return row["ai_messages_count"] or 0
-
-
-def ai_messages_remaining(telegram_id, limit):
-    return max(0, limit - get_ai_used_today(telegram_id))
+        return (row["ai_messages_count"] or 0) if row else 0
 
 
 def record_ai_message(telegram_id):
-    today = datetime.date.today().isoformat()
     with get_db() as db:
-        row = db.execute(
-            "SELECT ai_messages_count, ai_messages_date FROM users WHERE telegram_id=?",
+        db.execute(
+            "UPDATE users SET ai_messages_count = COALESCE(ai_messages_count, 0) + 1 "
+            "WHERE telegram_id=?",
             (telegram_id,),
-        ).fetchone()
-        if not row or row["ai_messages_date"] != today:
-            db.execute(
-                "UPDATE users SET ai_messages_count=1, ai_messages_date=? WHERE telegram_id=?",
-                (today, telegram_id),
-            )
-        else:
-            db.execute(
-                "UPDATE users SET ai_messages_count=ai_messages_count+1 WHERE telegram_id=?",
-                (telegram_id,),
-            )
+        )
 
 
 def get_quiz_accuracy(user_id, quiz_id):

@@ -39,11 +39,10 @@ BTN_AI = "🤖 AI yordamchi"
 BTN_TOLOV = "💳 To'lov"
 
 AI_SYSTEM_PROMPT = (
-    "Siz talabalarga huquq fanidan DTM va milliy sertifikat imtihoniga tayyorlanishda "
-    "yordam beruvchi do'stona AI yordamchisiz. Savolga aniq va tushunarli o'zbek tilida "
-    "javob bering. Huquqiy mavzular bo'yicha alohida chuqur bilim bilan yordam bering, "
-    "lekin boshqa har qanday savolga ham (umumiy bilim, maslahat va h.k.) yordam berishga "
-    "tayyor bo'ling. Javobni juda uzun qilmang - Telegram xabari sifatida o'qish qulay bo'lsin."
+    "Siz do'stona, umumiy AI yordamchisiz. Har qanday savolga - huquq, ta'lim, "
+    "kundalik hayot, umumiy bilim, maslahat va h.k. - tabiiy va tushunarli o'zbek "
+    "tilida javob bering. Javobni juda uzun qilmang - Telegram xabari sifatida "
+    "o'qish qulay bo'lsin."
 )
 
 # Shown wherever a buyer is deciding whether to pay - the guarantee and a
@@ -54,6 +53,17 @@ TRUST_NOTE = (
     f"biron sababga ko'ra qoniqmasangiz — pulingiz to'liq va so'zsiz qaytariladi.\n"
     f"❓ Savollar uchun: {config.SUPPORT_USERNAME}"
 )
+
+
+def payment_card_block():
+    """Card details for a payment message. If CARD_NUMBER is set, the number
+    renders as a <code> block - on mobile Telegram, tapping a code block
+    copies it instantly, much easier than long-pressing plain text. Falls
+    back to the legacy PAYMENT_INSTRUCTIONS text if CARD_NUMBER isn't set."""
+    if config.CARD_NUMBER:
+        holder_line = f"\n👤 Karta egasi: {config.CARD_HOLDER_NAME}" if config.CARD_HOLDER_NAME else ""
+        return f"💳 Karta raqami (bosib nusxalang):\n<code>{config.CARD_NUMBER}</code>{holder_line}"
+    return config.PAYMENT_INSTRUCTIONS
 
 # Rotated in the 24h-inactivity reminder so it doesn't feel like a copy-paste bot message.
 MOTIVATIONAL_LINES = [
@@ -180,36 +190,55 @@ def main_reply_keyboard(paid=False):
 async def ask_gemini(question: str):
     """Returns the AI's answer as text, or None if the call failed (missing
     key, network error, bad response, etc.) - caller shows a friendly
-    fallback message in that case rather than crashing."""
+    fallback message in that case rather than crashing.
+
+    Tries config.AI_MODEL first, then falls back to a couple of other
+    common model names if that one 404s (Google renames/retires models
+    over time, so a stale model name shouldn't take the whole feature down -
+    an auth error (401/403, meaning the key itself is wrong) will still fail
+    on every model, which is expected."""
     if not config.GEMINI_API_KEY:
         return None
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{config.AI_MODEL}:generateContent?key={config.GEMINI_API_KEY}"
-    )
+
+    models_to_try = [config.AI_MODEL, "gemini-2.0-flash", "gemini-1.5-flash"]
+    seen = set()
     payload = {
         "contents": [
             {"parts": [{"text": f"{AI_SYSTEM_PROMPT}\n\nSavol: {question}"}]}
         ]
     }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url, json=payload, timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logging.warning(f"Gemini API error ({resp.status}): {body}")
-                    return None
-                data = await resp.json()
-                try:
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
-                except (KeyError, IndexError, TypeError):
-                    logging.warning(f"Unexpected Gemini response shape: {data}")
-                    return None
-    except Exception as e:
-        logging.warning(f"Gemini API call failed: {e}")
-        return None
+
+    for model in models_to_try:
+        if model in seen:
+            continue
+        seen.add(model)
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={config.GEMINI_API_KEY}"
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, json=payload, timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logging.warning(f"Gemini API error on model '{model}' ({resp.status}): {body}")
+                        if resp.status in (401, 403):
+                            # Bad/missing API key - trying other models won't help.
+                            return None
+                        continue  # try the next model name
+                    data = await resp.json()
+                    try:
+                        return data["candidates"][0]["content"]["parts"][0]["text"]
+                    except (KeyError, IndexError, TypeError):
+                        logging.warning(f"Unexpected Gemini response shape from '{model}': {data}")
+                        continue
+        except Exception as e:
+            logging.warning(f"Gemini API call failed on model '{model}': {e}")
+            continue
+
+    return None
 
 
 def exam_countdown_line():
@@ -810,24 +839,47 @@ async def on_ai_button(message: Message, state: FSMContext):
             "🤖 AI yordamchi hozircha sozlanmoqda. Tez orada ishga tushadi!"
         )
         return
-    remaining = db.ai_messages_remaining(message.from_user.id, config.AI_DAILY_LIMIT)
-    if remaining <= 0:
-        await message.answer(
-            f"🤖 Bugungi {config.AI_DAILY_LIMIT} ta AI savolingiz tugadi. "
-            f"Ertaga qayta urinib ko'ring!"
-        )
+    user_id = message.from_user.id
+    paid = db.has_any_confirmed_purchase(user_id)
+    if not paid and db.get_ai_total_used(user_id) >= config.AI_DAILY_LIMIT:
+        await send_ai_paywall_prompt(message.chat.id, user_id)
         return
     await state.set_state(AIChat.waiting_question)
     await message.answer(
-        f"🤖 <b>AI yordamchi</b>\n\n"
-        f"Istalgan savolingizni yozing — huquq fanidan ham, boshqa mavzudan ham "
-        f"yordam bera olaman.\n\n"
-        f"Bugun yana <b>{remaining}</b> ta savol so'rashingiz mumkin.",
-        parse_mode="HTML",
+        "🤖 Men sizning yordamchingizman. Savollaringiz bo'lsa, yozing.",
     )
 
 
 _MENU_BUTTON_TEXTS = {BTN_TESTLAR, BTN_TAKLIF, BTN_REYTING, BTN_TARIX, BTN_AI, BTN_TOLOV}
+
+
+async def send_ai_paywall_prompt(chat_id, user_id):
+    """Shown once a free (non-premium) user hits their lifetime AI question
+    cap - never tells them the exact count, just that premium unlocks
+    unlimited AI (plus everything else premium already includes)."""
+    quizzes = db.list_quizzes()
+    quiz_id = quizzes[0]["id"] if quizzes else None
+    price = config.FULL_ACCESS_PRICE_UZS
+    discount_note = ""
+    if db.has_discount(user_id):
+        price = int(price * 0.8)
+        discount_note = " (20% taklif chegirmasi qo'llandi! 🎉)"
+    if quiz_id is not None and not db.has_any_pending_purchase(user_id):
+        db.request_purchase(user_id, quiz_id, price_uzs=price)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💳 To'lash", callback_data=f"paycard:{quiz_id}")
+    ]])
+    await bot.send_message(
+        chat_id,
+        "🤖 Bepul AI savollaringiz tugadi.\n\n"
+        "Premium bilan AI yordamchidan <b>cheksiz</b> foydalanasiz, "
+        "shuningdek barcha mavzulardagi testlarga ham umrbod kirish huquqiga "
+        "ega bo'lasiz! 🚀\n\n"
+        f"💰 Narxi: <b>{price:,} so'm</b>{discount_note}\n\n"
+        f"{TRUST_NOTE}",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
 
 
 @dp.message(StateFilter(AIChat.waiting_question), ~F.text.in_(_MENU_BUTTON_TEXTS))
@@ -837,13 +889,10 @@ async def on_ai_question(message: Message, state: FSMContext):
         return
 
     user_id = message.from_user.id
-    remaining = db.ai_messages_remaining(user_id, config.AI_DAILY_LIMIT)
-    if remaining <= 0:
+    paid = db.has_any_confirmed_purchase(user_id)
+    if not paid and db.get_ai_total_used(user_id) >= config.AI_DAILY_LIMIT:
         await state.clear()
-        await message.answer(
-            f"🤖 Bugungi {config.AI_DAILY_LIMIT} ta AI savolingiz tugadi. "
-            f"Ertaga qayta urinib ko'ring!"
-        )
+        await send_ai_paywall_prompt(message.chat.id, user_id)
         return
 
     thinking = await message.answer("🤖 O'ylayapman...")
@@ -856,17 +905,10 @@ async def on_ai_question(message: Message, state: FSMContext):
         )
         return
 
-    remaining_after = db.ai_messages_remaining(user_id, config.AI_DAILY_LIMIT)
     try:
-        await thinking.edit_text(
-            f"{answer}\n\n<i>Qolgan savollar bugun: {remaining_after}</i>",
-            parse_mode="HTML",
-        )
+        await thinking.edit_text(answer, parse_mode="HTML")
     except Exception:
-        await message.answer(
-            f"{answer}\n\n<i>Qolgan savollar bugun: {remaining_after}</i>",
-            parse_mode="HTML",
-        )
+        await message.answer(answer, parse_mode="HTML")
     # Stay in AIChat.waiting_question so the user can keep asking follow-ups
     # without pressing the button again each time.
 
@@ -918,7 +960,7 @@ async def on_tolov_button(message: Message, state: FSMContext):
 
     await message.answer(
         f"💳 <b>To'lov ma'lumotlari</b>\n\n"
-        f"{config.PAYMENT_INSTRUCTIONS}\n\n"
+        f"{payment_card_block()}\n\n"
         f"💰 Narxi: <b>{price:,} so'm</b>{discount_note}\n\n"
         f"To'lov qilgach, screenshotni shu botga rasm qilib yuboring 📸\n\n"
         f"{status_line}\n\n"
@@ -1099,7 +1141,7 @@ async def on_tahlil_pressed(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("paycard:"))
 async def on_paycard_pressed(callback: CallbackQuery):
     await callback.message.answer(
-        f"{config.PAYMENT_INSTRUCTIONS}\n\n"
+        f"{payment_card_block()}\n\n"
         f"To'lov qilgach, screenshotni shu botga rasm qilib yuboring 📸\n\n"
         f"{TRUST_NOTE}",
         parse_mode="HTML",

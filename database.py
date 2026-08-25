@@ -106,6 +106,22 @@ def init_db():
             db.execute("ALTER TABLE users ADD COLUMN ai_messages_count INTEGER DEFAULT 0")
         if "ai_messages_date" not in ucols:
             db.execute("ALTER TABLE users ADD COLUMN ai_messages_date TEXT")
+        if "learn_reason" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN learn_reason TEXT")
+        if "birth_year" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN birth_year INTEGER")
+        if "level" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN level TEXT")
+        if "onboarding_done" not in ucols:
+            db.execute("ALTER TABLE users ADD COLUMN onboarding_done INTEGER DEFAULT 0")
+
+        qzcols = [r["name"] for r in db.execute("PRAGMA table_info(quizzes)").fetchall()]
+        if "is_assessment" not in qzcols:
+            db.execute("ALTER TABLE quizzes ADD COLUMN is_assessment INTEGER DEFAULT 0")
+
+        qcols2 = [r["name"] for r in db.execute("PRAGMA table_info(questions)").fetchall()]
+        if "topic_tag" not in qcols2:
+            db.execute("ALTER TABLE questions ADD COLUMN topic_tag TEXT")
 
         pcols = [r["name"] for r in db.execute("PRAGMA table_info(purchases)").fetchall()]
         if "price_uzs" not in pcols:
@@ -245,6 +261,36 @@ def mark_reminder_sent(telegram_id):
     now = datetime.datetime.utcnow().isoformat()
     with get_db() as db:
         db.execute("UPDATE users SET last_reminder_sent=? WHERE telegram_id=?", (now, telegram_id))
+
+
+# ---------- onboarding survey ----------
+
+def has_completed_onboarding(telegram_id):
+    with get_db() as db:
+        row = db.execute(
+            "SELECT onboarding_done FROM users WHERE telegram_id=?", (telegram_id,)
+        ).fetchone()
+        return bool(row and row["onboarding_done"])
+
+
+def set_learn_reason(telegram_id, reason):
+    with get_db() as db:
+        db.execute("UPDATE users SET learn_reason=? WHERE telegram_id=?", (reason, telegram_id))
+
+
+def set_birth_year(telegram_id, year):
+    with get_db() as db:
+        db.execute("UPDATE users SET birth_year=? WHERE telegram_id=?", (year, telegram_id))
+
+
+def set_level(telegram_id, level):
+    with get_db() as db:
+        db.execute("UPDATE users SET level=? WHERE telegram_id=?", (level, telegram_id))
+
+
+def mark_onboarding_done(telegram_id):
+    with get_db() as db:
+        db.execute("UPDATE users SET onboarding_done=1 WHERE telegram_id=?", (telegram_id,))
 
 
 # ---------- AI chat usage (free daily cap, shared across all users) ----------
@@ -411,6 +457,45 @@ def count_questions(quiz_id):
 ARTICLES_PER_MODULE = 10  # for article-tagged quizzes (e.g. the Constitution): 10 distinct moddas per test
 
 
+def is_assessment_quiz(quiz_id):
+    with get_db() as db:
+        row = db.execute("SELECT is_assessment FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
+        return bool(row and row["is_assessment"])
+
+
+def get_assessment_quiz():
+    """The single quiz marked as the level-placement test (is_assessment=1),
+    or None if the admin hasn't set one up yet with /setassessment."""
+    with get_db() as db:
+        return db.execute("SELECT * FROM quizzes WHERE is_assessment=1 LIMIT 1").fetchone()
+
+
+def set_assessment_quiz(quiz_id):
+    """Marks quiz_id as THE assessment test, unmarking any previous one
+    (only one assessment quiz exists at a time)."""
+    with get_db() as db:
+        db.execute("UPDATE quizzes SET is_assessment=0")
+        db.execute("UPDATE quizzes SET is_assessment=1 WHERE id=?", (quiz_id,))
+
+
+def get_assessment_breakdown(attempt_id):
+    """Per-topic_tag accuracy for one assessment attempt, plus the overall
+    total/correct. Questions without a topic_tag are grouped under
+    'Umumiy' so nothing silently disappears from the report."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT COALESCE(q.topic_tag, 'Umumiy') AS tag, "
+            "COUNT(*) AS total, SUM(aa.is_correct) AS correct "
+            "FROM attempt_answers aa "
+            "JOIN questions q ON q.id = aa.question_id "
+            "WHERE aa.attempt_id=? "
+            "GROUP BY tag "
+            "ORDER BY (CAST(correct AS FLOAT) / total) ASC",
+            (attempt_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def get_module_boundaries(quiz_id):
     """Splits a quiz's questions into modules (tests).
 
@@ -429,6 +514,11 @@ def get_module_boundaries(quiz_id):
     questions = get_questions(quiz_id)
     if not questions:
         return []
+
+    if is_assessment_quiz(quiz_id):
+        # The level-placement test is always ONE continuous 15-question test,
+        # never chunked into 10-question modules like regular quizzes.
+        return [(0, len(questions))]
 
     has_articles = all(q.get("article_number") for q in questions)
     boundaries = []
@@ -472,14 +562,14 @@ def _extract_article_number(text):
     return int(m.group(1)) if m else None
 
 
-def add_question(quiz_id, question_text, options, correct_index, order_index=0, explanation=None, article_number=None):
+def add_question(quiz_id, question_text, options, correct_index, order_index=0, explanation=None, article_number=None, topic_tag=None):
     if article_number is None:
         article_number = _extract_article_number(question_text) or _extract_article_number(explanation)
     with get_db() as db:
         db.execute(
-            "INSERT INTO questions (quiz_id, question_text, options, correct_index, order_index, explanation, article_number) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (quiz_id, question_text, json.dumps(options, ensure_ascii=False), correct_index, order_index, explanation, article_number),
+            "INSERT INTO questions (quiz_id, question_text, options, correct_index, order_index, explanation, article_number, topic_tag) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (quiz_id, question_text, json.dumps(options, ensure_ascii=False), correct_index, order_index, explanation, article_number, topic_tag),
         )
 
 
@@ -652,6 +742,16 @@ def reset_user_purchases(user_id):
     """Admin/testing helper: wipe a user's purchase history so they hit the paywall again."""
     with get_db() as db:
         db.execute("DELETE FROM purchases WHERE user_id=?", (user_id,))
+
+
+def reset_user_onboarding(user_id):
+    """Admin/testing helper: clears the onboarding survey so /start shows it again."""
+    with get_db() as db:
+        db.execute(
+            "UPDATE users SET onboarding_done=0, learn_reason=NULL, birth_year=NULL, level=NULL "
+            "WHERE telegram_id=?",
+            (user_id,),
+        )
 
 
 def get_pending_quiz_id(user_id):

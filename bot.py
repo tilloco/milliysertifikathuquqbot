@@ -107,8 +107,17 @@ class AIChat(StatesGroup):
     waiting_question = State()
 
 
+class Onboarding(StatesGroup):
+    waiting_reason = State()
+    waiting_birth_year = State()
+    waiting_level = State()
+
+
 def parse_bulk_questions(text):
-    """Parse a '===' separated block of questions into a list of dicts."""
+    """Parse a '===' separated block of questions into a list of dicts.
+    An optional 'Mavzu: <tag>' line (any position) tags the question with
+    which topic/branch it represents - used by the assessment test to
+    report per-branch weak points."""
     option_pattern = re.compile(r'^[A-D]\)\s*')
     questions = []
     for block in text.split("==="):
@@ -117,6 +126,7 @@ def parse_bulk_questions(text):
             continue
         question_lines, options, explanation_lines = [], [], []
         correct_index = None
+        topic_tag = None
         mode = "question"
         for line in lines:
             if option_pattern.match(line):
@@ -132,6 +142,8 @@ def parse_bulk_questions(text):
                 rest = line.split(":", 1)[1].strip()
                 if rest:
                     explanation_lines.append(rest)
+            elif line.lower().startswith("mavzu:"):
+                topic_tag = line.split(":", 1)[1].strip() or None
             elif mode == "question":
                 question_lines.append(line)
             elif mode == "explanation":
@@ -143,6 +155,7 @@ def parse_bulk_questions(text):
             "options": options,
             "correct_index": correct_index,
             "explanation": "\n".join(explanation_lines).strip() or None,
+            "topic_tag": topic_tag,
         })
     return questions
 
@@ -225,6 +238,141 @@ def progress_bar(done, total, length=10):
     return "▰" * filled + "▱" * (length - filled)
 
 
+LEVEL_LABELS = {"boshlangich": "🟢 Boshlang'ich", "orta": "🟡 O'rta", "yuqori": "🔴 Yuqori"}
+
+
+def compute_level(pct):
+    if pct >= 80:
+        return "yuqori"
+    if pct >= 50:
+        return "orta"
+    return "boshlangich"
+
+
+async def send_assessment_result(chat_id, user_id, attempt_id):
+    breakdown = db.get_assessment_breakdown(attempt_id)
+    if not breakdown:
+        await bot.send_message(chat_id, "Natijani hisoblab bo'lmadi. Qaytadan urinib ko'ring.")
+        return
+
+    total = sum(row["total"] for row in breakdown)
+    correct = sum(row["correct"] or 0 for row in breakdown)
+    pct = int(100 * correct / total) if total else 0
+    level_code = compute_level(pct)
+    db.set_level(user_id, level_code)
+
+    lines = [
+        "📊 <b>Darajani aniqlash natijasi</b>\n",
+        f"Umumiy natija: <b>{correct}/{total}</b> ({pct}%)",
+        f"Darajangiz: <b>{LEVEL_LABELS[level_code]}</b>\n",
+        "📉 <b>Sohalar bo'yicha tahlil:</b>",
+    ]
+    for row in breakdown:
+        row_pct = int(100 * (row["correct"] or 0) / row["total"]) if row["total"] else 0
+        mark = "🔴" if row_pct < 50 else ("🟡" if row_pct < 80 else "🟢")
+        lines.append(f"{mark} {row['tag']}: {row['correct'] or 0}/{row['total']} ({row_pct}%)")
+
+    weakest = breakdown[0]
+    if weakest["total"]:
+        weakest_pct = int(100 * (weakest["correct"] or 0) / weakest["total"])
+        lines.append(
+            f"\n🎯 <b>Eng zaif tomoningiz:</b> {weakest['tag']} ({weakest_pct}%). "
+            f"Shu sohaga ko'proq e'tibor bering!"
+        )
+
+    await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+    await send_welcome_menu(chat_id, user_id)
+
+
+async def offer_assessment(chat_id, state: FSMContext):
+    """Shown right after onboarding finishes - not forced, since a brand new
+    user hasn't seen any content yet and might rather just start browsing."""
+    assessment = db.get_assessment_quiz()
+    if not assessment:
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📊 Darajani aniqlash testini boshlash", callback_data=f"startassess:{assessment['id']}")
+    ]])
+    await bot.send_message(
+        chat_id,
+        "Xohlasangiz, 15 ta savoldan iborat qisqa test orqali hozirgi bilim "
+        "darajangizni va eng zaif tomoningizni aniqlab olishingiz mumkin 👇",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("startassess:"))
+async def on_start_assessment(callback: CallbackQuery):
+    quiz_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+    db.start_attempt(user_id, quiz_id, module_number=1)
+    attempt = db.get_active_attempt(user_id, quiz_id)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer("📊 Darajani aniqlash testi boshlandi! 15 ta savol.")
+    await send_question(callback.message.chat.id, quiz_id, attempt, user_id)
+    await callback.answer()
+
+
+LEARN_REASON_OPTIONS = [
+    ("dtm", "📚 DTM imtihoniga tayyorgarlik"),
+    ("sertifikat", "🎓 Milliy sertifikat uchun"),
+    ("kasb", "💼 Kasbim/ishim uchun kerak"),
+    ("qiziqish", "🤔 Shunchaki qiziqaman"),
+]
+
+LEVEL_OPTIONS = [
+    ("boshlangich", "🟢 Boshlang'ich"),
+    ("orta", "🟡 O'rta"),
+    ("yuqori", "🔴 Yuqori"),
+]
+
+
+def onboarding_reason_keyboard():
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for code, label in LEARN_REASON_OPTIONS:
+        kb.inline_keyboard.append([InlineKeyboardButton(text=label, callback_data=f"onbreason:{code}")])
+    return kb
+
+
+def onboarding_level_keyboard():
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for code, label in LEVEL_OPTIONS:
+        kb.inline_keyboard.append([InlineKeyboardButton(text=label, callback_data=f"onblevel:{code}")])
+    return kb
+
+
+def onboarding_year_skip_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="O'tkazib yuborish", callback_data="onbyear:skip")
+    ]])
+
+
+async def start_onboarding(chat_id, state: FSMContext):
+    await state.set_state(Onboarding.waiting_reason)
+    await bot.send_message(chat_id, "Xush kelibsiz! Sizni yaxshiroq tushunish uchun 3 ta qisqa savol 👇")
+    await bot.send_message(
+        chat_id,
+        "1️⃣ Nima uchun huquq fanini o'rganyapsiz?",
+        reply_markup=onboarding_reason_keyboard(),
+    )
+
+
+async def send_welcome_menu(chat_id, user_id):
+    paid = db.has_any_confirmed_purchase(user_id)
+    await bot.send_message(
+        chat_id,
+        f"{exam_countdown_line()}"
+        "Assalomu alaykum! 👋\n\n"
+        "Huquq fanidan testlar shu yerda. Pastdagi menyudan foydalaning 👇\n\n"
+        "🏆 Har oy TOP-3 faolga pul bonusi!",
+        reply_markup=main_reply_keyboard(paid=paid),
+        parse_mode="HTML",
+    )
+
+
 def weak_topic_line(user_id):
     """One or two lines pointing the user at their weakest topic, or '' if we
     don't yet have enough answered questions to be confident about it."""
@@ -258,8 +406,13 @@ async def send_referral_info(message: Message):
 
 
 def topics_keyboard():
+    """Regular topic browser - the assessment test is deliberately excluded
+    here since it's a special one-shot flow (offered after onboarding, or
+    via /darajam), not just another topic to pick and grind through."""
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for q in db.list_quizzes():
+        if q["is_assessment"]:
+            continue
         kb.inline_keyboard.append([
             InlineKeyboardButton(text=f"📘 {q['title']}", callback_data=f"topic:{q['id']}")
         ])
@@ -411,6 +564,11 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
 
     if idx >= module_end:
         db.finish_attempt(attempt["id"])
+
+        if quiz["is_assessment"]:
+            await send_assessment_result(chat_id, user_id, attempt["id"])
+            return
+
         score = attempt["score"]
         total = module_end - module_start
         total_modules = db.count_modules(quiz_id)
@@ -435,7 +593,7 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
         return
 
     paid = db.has_any_confirmed_purchase(user_id)
-    if not paid and db.get_daily_free_used(user_id) >= db.DAILY_FREE_LIMIT:
+    if not quiz["is_assessment"] and not paid and db.get_daily_free_used(user_id) >= db.DAILY_FREE_LIMIT:
         db.finish_attempt(attempt["id"])
         await send_daily_limit_prompt(chat_id, quiz, user_id)
         return
@@ -471,22 +629,83 @@ dp.update.outer_middleware(ActivityMiddleware())
 # ---------------- user commands ----------------
 
 @dp.message(Command("start"))
-async def cmd_start(message: Message, command: CommandObject):
+async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
     referred_by = None
     if command.args and command.args.strip().isdigit():
         ref_id = int(command.args.strip())
         if ref_id != message.from_user.id:
             referred_by = ref_id
     db.upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name, referred_by)
-    paid = db.has_any_confirmed_purchase(message.from_user.id)
-    await message.answer(
-        f"{exam_countdown_line()}"
-        "Assalomu alaykum! 👋\n\n"
-        "Huquq fanidan testlar shu yerda. Pastdagi menyudan foydalaning 👇\n\n"
-        "🏆 Har oy TOP-3 faolga pul bonusi!",
-        reply_markup=main_reply_keyboard(paid=paid),
-        parse_mode="HTML",
+
+    if not db.has_completed_onboarding(message.from_user.id):
+        await start_onboarding(message.chat.id, state)
+        return
+
+    await send_welcome_menu(message.chat.id, message.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("onbreason:"))
+async def on_onboarding_reason(callback: CallbackQuery, state: FSMContext):
+    code = callback.data.split(":", 1)[1]
+    db.set_learn_reason(callback.from_user.id, code)
+    await state.set_state(Onboarding.waiting_birth_year)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(
+        "2️⃣ Tug'ilgan yilingiz? (masalan: 2005)",
+        reply_markup=onboarding_year_skip_keyboard(),
     )
+    await callback.answer()
+
+
+@dp.message(StateFilter(Onboarding.waiting_birth_year))
+async def on_onboarding_birth_year(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    current_year = datetime.date.today().year
+    if not text.isdigit() or not (current_year - 100 <= int(text) <= current_year - 5):
+        await message.answer(
+            "Iltimos, to'g'ri yilni raqamda yuboring (masalan: 2005), "
+            "yoki yuqoridagi tugma orqali o'tkazib yuboring."
+        )
+        return
+    db.set_birth_year(message.from_user.id, int(text))
+    await state.set_state(Onboarding.waiting_level)
+    await message.answer(
+        "3️⃣ Huquq fanidan hozirgi bilim darajangiz qanday?",
+        reply_markup=onboarding_level_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "onbyear:skip")
+async def on_onboarding_year_skip(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Onboarding.waiting_level)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(
+        "3️⃣ Huquq fanidan hozirgi bilim darajangiz qanday?",
+        reply_markup=onboarding_level_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("onblevel:"))
+async def on_onboarding_level(callback: CallbackQuery, state: FSMContext):
+    code = callback.data.split(":", 1)[1]
+    db.set_level(callback.from_user.id, code)
+    db.mark_onboarding_done(callback.from_user.id)
+    await state.clear()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer("Rahmat! Endi boshlashimiz mumkin 🚀")
+    await send_welcome_menu(callback.message.chat.id, callback.from_user.id)
+    await offer_assessment(callback.message.chat.id, state)
+    await callback.answer()
 
 
 @dp.message(F.text == BTN_TESTLAR)
@@ -687,6 +906,17 @@ async def on_topics_pressed(callback: CallbackQuery):
 @dp.message(Command("taklif"))
 async def cmd_referral(message: Message):
     await send_referral_info(message)
+
+
+@dp.message(Command("darajam"))
+async def cmd_darajam(message: Message, state: FSMContext):
+    """Lets any user (re)take the level-placement test on demand, not just
+    right after onboarding."""
+    assessment = db.get_assessment_quiz()
+    if not assessment:
+        await message.answer("Darajani aniqlash testi hali sozlanmagan.")
+        return
+    await offer_assessment(message.chat.id, state)
 
 
 @dp.message(Command("kunlik"))
@@ -906,7 +1136,7 @@ async def on_answer(callback: CallbackQuery):
 
     db.record_answer(attempt["id"], q["id"], chosen, correct)
     db.advance_attempt(attempt["id"], correct)
-    if not db.has_any_confirmed_purchase(user_id):
+    if not db.has_any_confirmed_purchase(user_id) and not db.is_assessment_quiz(quiz_id):
         db.record_daily_free_answer(user_id)
 
     # Small toast that auto-dismisses - no blocking popup to interrupt them.
@@ -1111,7 +1341,8 @@ async def cmd_pending(message: Message):
 
 @dp.message(Command("resetuser"))
 async def cmd_resetuser(message: Message, command: CommandObject):
-    # Admin/testing helper: wipe a user's purchase history so they hit the paywall again.
+    # Admin/testing helper: wipe a user's purchase + onboarding history so they
+    # hit the paywall and the onboarding survey again.
     if message.from_user.id != config.ADMIN_ID:
         return
     if not command.args or not command.args.strip().isdigit():
@@ -1119,7 +1350,8 @@ async def cmd_resetuser(message: Message, command: CommandObject):
         return
     user_id = int(command.args.strip())
     db.reset_user_purchases(user_id)
-    await message.answer(f"✅ {user_id} uchun barcha xaridlar tozalandi. Endi u qaytadan bepul sinovdan boshlaydi.")
+    db.reset_user_onboarding(user_id)
+    await message.answer(f"✅ {user_id} uchun barcha xaridlar va so'rovnoma tozalandi. Endi u qaytadan boshlaydi.")
 
 
 @dp.message(Command("stats"))
@@ -1204,8 +1436,30 @@ async def cmd_listquizzes(message: Message):
     lines = []
     for q in quizzes:
         n = db.count_questions(q["id"])
-        lines.append(f"ID {q['id']}: {q['title']} — {q['price_uzs']:,} so'm — {n} ta savol — bepul: {q['free_questions']}")
+        tag = " 📊 [DARAJANI ANIQLASH]" if q["is_assessment"] else ""
+        lines.append(f"ID {q['id']}: {q['title']} — {q['price_uzs']:,} so'm — {n} ta savol — bepul: {q['free_questions']}{tag}")
     await message.answer("\n".join(lines))
+
+
+@dp.message(Command("setassessment"))
+async def cmd_setassessment(message: Message, command: CommandObject):
+    """Admin: /setassessment <quiz_id> - marks that quiz as THE 15-question
+    level-placement test shown right after onboarding. Only one at a time;
+    setting a new one unmarks the previous."""
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    if not command.args or not command.args.strip().isdigit():
+        await message.answer("Foydalanish: /setassessment <test_id>\n\n/listquizzes orqali ID'larni ko'ring.")
+        return
+    quiz_id = int(command.args.strip())
+    quiz = db.get_quiz(quiz_id)
+    if not quiz:
+        await message.answer("Bunday ID li test topilmadi.")
+        return
+    n = db.count_questions(quiz_id)
+    db.set_assessment_quiz(quiz_id)
+    note = "" if n == 15 else f"\n⚠️ Eslatma: bu testda {n} ta savol bor, tavsiya etilgan 15 ta emas."
+    await message.answer(f"✅ \"{quiz['title']}\" endi Darajani aniqlash testi sifatida belgilandi.{note}")
 
 
 # ---------------- admin: add question conversation ----------------
@@ -1267,6 +1521,7 @@ async def addq_got_bulk_file(message: Message, state: FSMContext):
             correct_index=q["correct_index"],
             order_index=start_index + i,
             explanation=q["explanation"],
+            topic_tag=q.get("topic_tag"),
         )
     total = db.count_questions(quiz_id)
     await state.clear()

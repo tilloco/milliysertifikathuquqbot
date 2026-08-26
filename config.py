@@ -79,7 +79,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # model name if this one ever stops working - Google renames/retires models
 # over time, so this is deliberately an env var you can update without a
 # code change.
-AI_MODEL = os.getenv("AI_MODEL", "gemini-2.0-flash")
+AI_MODEL = os.getenv("AI_MODEL", "gemini-3.6-flash")
 
 # Free questions per user - LIFETIME total, not per day. After this many,
 # the AI button redirects to the payment flow instead of answering (the

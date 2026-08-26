@@ -205,7 +205,7 @@ async def ask_gemini(question: str):
     if not config.GEMINI_API_KEY:
         return None
 
-    models_to_try = [config.AI_MODEL, "gemini-2.0-flash", "gemini-1.5-flash"]
+    models_to_try = [config.AI_MODEL, "gemini-3.6-flash", "gemini-2.5-flash"]
     seen = set()
     payload = {
         "contents": [
@@ -256,7 +256,7 @@ async def ask_gemini_vision(image_bytes: bytes, mime_type: str, prompt: str):
 
     import base64
     b64_image = base64.b64encode(image_bytes).decode("ascii")
-    models_to_try = [config.AI_MODEL, "gemini-2.0-flash", "gemini-1.5-flash"]
+    models_to_try = [config.AI_MODEL, "gemini-3.6-flash", "gemini-2.5-flash"]
     seen = set()
     payload = {
         "contents": [{

@@ -416,9 +416,18 @@ def onboarding_time_keyboard():
 
 
 async def start_onboarding(chat_id, state: FSMContext):
+    """The whole 5-question survey lives in ONE message that gets edited in
+    place at every step, instead of piling up 5+ separate messages in the
+    chat - much cleaner. We remember its message_id so the one text-answer
+    step (the name) can edit it too, since that reply has no callback to
+    hang the edit off of."""
     await state.set_state(Onboarding.waiting_name)
-    await bot.send_message(chat_id, "Xush kelibsiz! Sizni yaxshiroq tushunish uchun 5 ta qisqa savol 👇")
-    await bot.send_message(chat_id, "1️⃣ Ismingiz?")
+    sent = await bot.send_message(
+        chat_id,
+        "Xush kelibsiz! Sizni yaxshiroq tushunish uchun 5 ta qisqa savol 👇\n\n"
+        "1️⃣ Ismingiz?",
+    )
+    await state.update_data(survey_chat_id=chat_id, survey_msg_id=sent.message_id)
 
 
 async def send_welcome_menu(chat_id, user_id):
@@ -713,10 +722,22 @@ async def on_onboarding_name(message: Message, state: FSMContext):
         return
     db.set_onboarding_name(message.from_user.id, name[:100])
     await state.set_state(Onboarding.waiting_reason)
-    await message.answer(
-        f"Rahmat, {name}! 2️⃣ Huquqni nima uchun o'rganyapsiz?",
-        reply_markup=onboarding_reason_keyboard(),
-    )
+    data = await state.get_data()
+    survey_chat_id = data.get("survey_chat_id")
+    survey_msg_id = data.get("survey_msg_id")
+    text = f"Rahmat, {name}! 2️⃣ Huquqni nima uchun o'rganyapsiz?"
+    kb = onboarding_reason_keyboard()
+    if survey_msg_id:
+        try:
+            await bot.edit_message_text(
+                text, chat_id=survey_chat_id, message_id=survey_msg_id, reply_markup=kb
+            )
+            return
+        except Exception:
+            pass
+    # Fallback if the original card couldn't be edited for any reason.
+    sent = await message.answer(text, reply_markup=kb)
+    await state.update_data(survey_chat_id=message.chat.id, survey_msg_id=sent.message_id)
 
 
 @dp.callback_query(F.data.startswith("onbreason:"))
@@ -724,11 +745,7 @@ async def on_onboarding_reason(callback: CallbackQuery, state: FSMContext):
     code = callback.data.split(":", 1)[1]
     db.set_learn_reason(callback.from_user.id, code)
     await state.set_state(Onboarding.waiting_target)
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    await callback.message.answer(
+    await callback.message.edit_text(
         "3️⃣ Milliy sertifikat bo'yicha maqsadingiz?",
         reply_markup=onboarding_target_keyboard(),
     )
@@ -740,11 +757,7 @@ async def on_onboarding_target(callback: CallbackQuery, state: FSMContext):
     code = callback.data.split(":", 1)[1]
     db.set_target_grade(callback.from_user.id, code)
     await state.set_state(Onboarding.waiting_level)
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    await callback.message.answer(
+    await callback.message.edit_text(
         "4️⃣ Huquq fanidan hozirgi bilim darajangiz qanday?",
         reply_markup=onboarding_level_keyboard(),
     )
@@ -756,11 +769,7 @@ async def on_onboarding_level(callback: CallbackQuery, state: FSMContext):
     code = callback.data.split(":", 1)[1]
     db.set_level(callback.from_user.id, code)
     await state.set_state(Onboarding.waiting_time)
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    await callback.message.answer(
+    await callback.message.edit_text(
         "5️⃣ Tayyorgarlik uchun qancha vaqtingiz bor?",
         reply_markup=onboarding_time_keyboard(),
     )
@@ -772,12 +781,8 @@ async def on_onboarding_time(callback: CallbackQuery, state: FSMContext):
     code = callback.data.split(":", 1)[1]
     db.set_prep_time(callback.from_user.id, code)
     db.mark_onboarding_done(callback.from_user.id)
+    await callback.message.edit_text("✅ Rahmat! Endi boshlashimiz mumkin 🚀")
     await state.clear()
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    await callback.message.answer("Rahmat! Endi boshlashimiz mumkin 🚀")
     await send_welcome_menu(callback.message.chat.id, callback.from_user.id)
     await offer_assessment(callback.message.chat.id, state)
     await callback.answer()

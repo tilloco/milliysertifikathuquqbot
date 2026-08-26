@@ -386,6 +386,11 @@ PREP_TIME_OPTIONS = [
     ("6oyplus", "6 oy+"),
 ]
 
+# code -> display label, for rendering /userinfo and /onboardingstats output
+REASON_LABELS = dict(LEARN_REASON_OPTIONS)
+TARGET_LABELS = dict(TARGET_GRADE_OPTIONS)
+PREP_TIME_LABELS = dict(PREP_TIME_OPTIONS)
+
 
 def onboarding_reason_keyboard():
     kb = InlineKeyboardMarkup(inline_keyboard=[])
@@ -1454,6 +1459,83 @@ async def cmd_resetuser(message: Message, command: CommandObject):
     db.reset_user_purchases(user_id)
     db.reset_user_onboarding(user_id)
     await message.answer(f"✅ {user_id} uchun barcha xaridlar va so'rovnoma tozalandi. Endi u qaytadan boshlaydi.")
+
+
+@dp.message(Command("userinfo"))
+async def cmd_userinfo(message: Message, command: CommandObject):
+    """Admin: /userinfo <user_id> - shows one user's onboarding survey
+    answers plus purchase/activity status, all in one place."""
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    if not command.args or not command.args.strip().isdigit():
+        await message.answer("Foydalanish: /userinfo <user_id>")
+        return
+    user_id = int(command.args.strip())
+    profile = db.get_user_profile(user_id)
+    if not profile:
+        await message.answer("Bunday foydalanuvchi topilmadi.")
+        return
+
+    name = profile.get("onboarding_name") or profile.get("first_name") or "Noma'lum"
+    username = f"@{profile['username']}" if profile.get("username") else "—"
+    premium_line = "✅ Premium" if profile["is_premium"] else "❌ Bepul foydalanuvchi"
+
+    lines = [
+        f"👤 <b>{name}</b> ({username})",
+        f"ID: <code>{user_id}</code>",
+        premium_line,
+        "",
+    ]
+
+    if not profile.get("onboarding_done"):
+        lines.append("⚠️ So'rovnomani hali to'ldirmagan.")
+    else:
+        lines.append("📋 <b>So'rovnoma javoblari:</b>")
+        reason = REASON_LABELS.get(profile.get("learn_reason"), "—")
+        target = TARGET_LABELS.get(profile.get("target_grade"), "—")
+        level = LEVEL_LABELS.get(profile.get("level"), "—")
+        prep_time = PREP_TIME_LABELS.get(profile.get("prep_time"), "—")
+        lines.append(f"• Sabab: {reason}")
+        lines.append(f"• Maqsad (sertifikat): {target}")
+        lines.append(f"• Daraja: {level}")
+        lines.append(f"• Tayyorgarlik vaqti: {prep_time}")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("onboardingstats"))
+async def cmd_onboardingstats(message: Message):
+    """Admin: /onboardingstats - aggregate breakdown across every field in
+    the onboarding survey, for understanding your user base at a glance."""
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    stats = db.get_onboarding_stats()
+    if stats["total_completed"] == 0:
+        await message.answer("Hali hech kim so'rovnomani to'ldirmagan.")
+        return
+
+    def format_group(title, rows, label_map):
+        if not rows:
+            return f"{title}: ma'lumot yo'q"
+        parts = [f"{title}:"]
+        for code, count in rows:
+            label = label_map.get(code, code)
+            parts.append(f"   {label}: {count}")
+        return "\n".join(parts)
+
+    lines = [
+        f"📋 <b>So'rovnoma statistikasi</b>",
+        f"Jami to'ldirganlar: <b>{stats['total_completed']}</b>",
+        "",
+        format_group("🎯 Sabab", stats["reason"], REASON_LABELS),
+        "",
+        format_group("🏅 Maqsad (sertifikat)", stats["target"], TARGET_LABELS),
+        "",
+        format_group("📊 Daraja", stats["level"], LEVEL_LABELS),
+        "",
+        format_group("⏳ Tayyorgarlik vaqti", stats["prep_time"], PREP_TIME_LABELS),
+    ]
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("stats"))

@@ -309,6 +309,48 @@ def mark_onboarding_done(telegram_id):
         db.execute("UPDATE users SET onboarding_done=1 WHERE telegram_id=?", (telegram_id,))
 
 
+def get_user_profile(telegram_id):
+    """Full profile for one user: identity, onboarding survey answers,
+    purchase status, and activity - used by /userinfo."""
+    with get_db() as db:
+        row = db.execute("SELECT * FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+        if not row:
+            return None
+        profile = dict(row)
+        profile["is_premium"] = bool(
+            db.execute(
+                "SELECT 1 FROM purchases WHERE user_id=? AND status='confirmed' LIMIT 1",
+                (telegram_id,),
+            ).fetchone()
+        )
+        return profile
+
+
+def get_onboarding_stats():
+    """Aggregate counts across every field collected in the onboarding
+    survey, for users who completed it - used by /onboardingstats."""
+    with get_db() as db:
+        total_completed = db.execute(
+            "SELECT COUNT(*) AS c FROM users WHERE onboarding_done=1"
+        ).fetchone()["c"]
+
+        def counts_for(column):
+            rows = db.execute(
+                f"SELECT {column} AS val, COUNT(*) AS c FROM users "
+                f"WHERE onboarding_done=1 AND {column} IS NOT NULL "
+                f"GROUP BY {column} ORDER BY c DESC"
+            ).fetchall()
+            return [(r["val"], r["c"]) for r in rows]
+
+        return {
+            "total_completed": total_completed,
+            "reason": counts_for("learn_reason"),
+            "target": counts_for("target_grade"),
+            "level": counts_for("level"),
+            "prep_time": counts_for("prep_time"),
+        }
+
+
 # ---------- AI chat usage (free LIFETIME cap per user, unlimited for premium) ----------
 
 def get_ai_total_used(telegram_id):

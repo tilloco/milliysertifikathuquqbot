@@ -44,6 +44,13 @@ FULL_ACCESS_PRICE_UZS = int(os.getenv("FULL_ACCESS_PRICE_UZS", "12000"))
 MINIWEB_ADMIN_URL = os.getenv("MINIWEB_ADMIN_URL", "https://telegram-mini-ai.onrender.com")
 MINIWEB_ADMIN_KEY = os.getenv("MINIWEB_ADMIN_KEY", "")
 
+# URL that opens when the user taps the "🎯 Mock" button on the main menu -
+# this is what the USER sees (the frontend), which may differ from
+# MINIWEB_ADMIN_URL above (that one is only used for server-to-server admin
+# calls). Defaults to the same URL if you haven't set a separate one. Must
+# be https - Telegram won't open a plain http web_app button.
+MINIWEB_APP_URL = os.getenv("MINIWEB_APP_URL", MINIWEB_ADMIN_URL)
+
 # --- Exam countdown ---
 # Date of the "milliy sertifikat" exam, shown as a big countdown on /start.
 # Format: YYYY-MM-DD (e.g. "2026-12-15"). Leave blank to hide the countdown

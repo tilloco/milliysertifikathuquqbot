@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import datetime
+import json
 import logging
 import random
 import re
@@ -35,7 +37,7 @@ MODULE_SIZE = 10
 BTN_TESTLAR = "📝 Testlar"
 BTN_TAKLIF = "💡 Taklif-fikr"
 BTN_REYTING = "🏆 Reyting"
-BTN_TARIX = "🕐 Tarix"
+BTN_PROGRESS = "📈 Progress"
 BTN_AI = "🤖 AI yordamchi"
 BTN_TOLOV = "💳 To'lov"
 
@@ -181,11 +183,22 @@ def main_reply_keyboard(paid=False):
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_TESTLAR), KeyboardButton(text=BTN_TAKLIF)],
-            [KeyboardButton(text=BTN_REYTING), KeyboardButton(text=BTN_TARIX)],
+            [KeyboardButton(text=BTN_REYTING), KeyboardButton(text=BTN_PROGRESS)],
             [KeyboardButton(text=BTN_AI), KeyboardButton(text=BTN_TOLOV)],
         ],
         resize_keyboard=True,
     )
+
+
+def _safe_int(value):
+    """Best-effort int parse for AI-extracted amounts like '12,000' or '12000 so'm'."""
+    try:
+        if value is None:
+            return None
+        cleaned = str(value).replace(",", "").replace(" ", "").replace("so'm", "").strip()
+        return int(cleaned)
+    except (ValueError, TypeError):
+        return None
 
 
 async def ask_gemini(question: str):
@@ -242,6 +255,72 @@ async def ask_gemini(question: str):
     return None
 
 
+async def analyze_payment_screenshot(image_bytes: bytes, expected_price: int):
+    """Asks Gemini vision to read a payment screenshot and report what it sees,
+    so the admin can approve/reject faster instead of reading every screenshot
+    carefully. Best-effort only - returns None on any failure (missing key,
+    network error, bad response). NEVER used to auto-approve - the admin's
+    Confirm/Reject buttons are unaffected either way, this only adds a note
+    to the caption the admin already reviews."""
+    if not config.GEMINI_API_KEY:
+        return None
+
+    b64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+    prompt = (
+        "Bu to'lov screenshoti (Click, Payme, bank ilovasi yoki karta o'tkazmasi "
+        "bo'lishi mumkin). Rasmni tahlil qiling va FAQAT quyidagi JSON formatida "
+        "javob bering, boshqa hech narsa yozmang:\n\n"
+        "{\n"
+        '  "is_payment_screenshot": true yoki false,\n'
+        '  "amount_detected": rasmda ko\'ringan summa (faqat raqam, agar aniq bo\'lmasa null),\n'
+        '  "status_success": true agar to\'lov muvaffaqiyatli ko\'rinsa, false agar xato/bekor bo\'lsa, null agar aniq bo\'lmasa,\n'
+        '  "note": bir qisqa jumla bilan o\'zbek tilida izoh\n'
+        "}\n\n"
+        f"Kutilayotgan summa: {expected_price} so'm."
+    )
+
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{config.AI_MODEL}:generateContent?key={config.GEMINI_API_KEY}"
+    )
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64_image}},
+            ]
+        }]
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status != 200:
+                    logging.warning(f"Gemini vision error ({resp.status}): {await resp.text()}")
+                    return None
+                data = await resp.json()
+                try:
+                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                except (KeyError, IndexError, TypeError):
+                    logging.warning(f"Unexpected Gemini vision response shape: {data}")
+                    return None
+    except Exception as e:
+        logging.warning(f"Gemini vision call failed: {e}")
+        return None
+
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r'^```(?:json)?\n?', '', cleaned)
+        cleaned = re.sub(r'\n?```$', '', cleaned)
+
+    try:
+        return json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        logging.warning(f"Could not parse Gemini vision JSON: {text}")
+        return None
+
+
 def exam_countdown_line():
     """Big banner shown at the top of /start. Returns '' if EXAM_DATE isn't
     configured yet or is invalid/in the past, so nothing breaks if you haven't
@@ -279,6 +358,36 @@ def compute_level(pct):
     if pct >= 50:
         return "orta"
     return "boshlangich"
+
+
+# Growth badges shown on the Progress screen, ordered lowest -> highest.
+# get_achievement() picks the highest one the user has reached; the next
+# tuple up (if any) becomes the "keyingi darajagacha" target - this is what
+# gives the screen its sense of real, visible growth instead of a flat report.
+ACHIEVEMENT_LEVELS = [
+    (0, "🌱 Boshlang'ich"),
+    (40, "🥉 O'rtacha"),
+    (60, "🥈 Yaxshi"),
+    (75, "🥇 A'lo"),
+    (90, "🏆 Ustoz darajasi"),
+]
+
+
+def get_achievement(pct):
+    label = ACHIEVEMENT_LEVELS[0][1]
+    for threshold, lbl in ACHIEVEMENT_LEVELS:
+        if pct >= threshold:
+            label = lbl
+    return label
+
+
+def next_achievement(pct):
+    """Returns (threshold, label) for the next badge up, or (None, None) if
+    already at the top badge."""
+    for threshold, lbl in ACHIEVEMENT_LEVELS:
+        if pct < threshold:
+            return threshold, lbl
+    return None, None
 
 
 async def send_assessment_result(chat_id, user_id, attempt_id):
@@ -546,45 +655,63 @@ async def send_leaderboard(chat_id):
     await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
-async def send_history(chat_id, user_id):
+async def send_progress(chat_id, user_id):
+    """The old /tarix dump listed every quiz whether the user had touched it
+    or not, which buried real progress under empty rows. This only shows
+    quizzes the user has actually answered questions in, leads with an
+    achievement badge + overall accuracy, and closes with how far to the
+    next badge - the goal is for it to feel like a growth screen, not a
+    report."""
     quizzes = db.list_quizzes()
-    if not quizzes:
-        await bot.send_message(chat_id, "Hozircha testlar mavjud emas.")
+    solved = []
+    for q in quizzes:
+        acc = db.get_quiz_accuracy(user_id, q["id"])
+        if acc:
+            solved.append((q, acc))
+
+    if not solved:
+        await bot.send_message(
+            chat_id,
+            "📈 <b>Sizning o'sishingiz</b>\n\n"
+            "Hali natija yo'q — birinchi savolni yeching, o'sishingiz shu yerdan "
+            "boshlanadi! 🚀\n\n\"📝 Testlar\" tugmasini bosib boshlang.",
+            parse_mode="HTML",
+        )
         return
 
-    lines = ["🕐 <b>Sizning tarixingiz</b>", ""]
-    total_done, total_all = 0, 0
-    total_correct, total_answered = 0, 0
-    any_progress = False
+    total_correct = sum(acc["correct"] for _, acc in solved)
+    total_answered = sum(acc["total"] for _, acc in solved)
+    overall_pct = int(100 * total_correct / total_answered) if total_answered else 0
+    achievement = get_achievement(overall_pct)
 
-    for q in quizzes:
+    lines = [
+        "📈 <b>Sizning o'sishingiz</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"{achievement}",
+        f"🎯 Umumiy aniqlik: <b>{overall_pct}%</b>  ({total_correct}/{total_answered} to'g'ri)",
+        "",
+    ]
+
+    # Only real, touched topics - no empty "0/12 test" rows for things the
+    # user hasn't started, which is what made the old view feel flat.
+    for q, acc in sorted(solved, key=lambda pair: pair[1]["total"], reverse=True):
+        pct = int(100 * acc["correct"] / acc["total"]) if acc["total"] else 0
         total_modules = db.count_modules(q["id"])
         completed = db.get_completed_modules(user_id, q["id"])
         done = len(completed)
-        total_done += done
-        total_all += total_modules
-
+        badge = "🟢" if pct >= 80 else ("🟡" if pct >= 50 else "🔴")
         lines.append(f"📘 <b>{q['title']}</b>")
-        lines.append(f"{progress_bar(done, total_modules)}  {done}/{total_modules} test")
-
-        acc = db.get_quiz_accuracy(user_id, q["id"])
-        if acc:
-            any_progress = True
-            pct = int(100 * acc["correct"] / acc["total"])
-            lines.append(f"✅ To'g'ri javoblar: {acc['correct']}/{acc['total']} ({pct}%)")
-            total_correct += acc["correct"]
-            total_answered += acc["total"]
+        lines.append(f"{progress_bar(done, total_modules)}  {done}/{total_modules} test tugallandi")
+        lines.append(f"{badge} Aniqlik: {pct}%  ({acc['correct']}/{acc['total']} to'g'ri)")
         lines.append("")
 
+    threshold, next_label = next_achievement(overall_pct)
     lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append("📊 <b>Umumiy natija</b>")
-    lines.append(f"{progress_bar(total_done, total_all)}  {total_done}/{total_all} test yakunlangan")
-    if total_answered:
-        overall_pct = int(100 * total_correct / total_answered)
-        lines.append(f"🎯 Aniqlik: {total_correct}/{total_answered} to'g'ri ({overall_pct}%)")
-
-    if not any_progress:
-        lines.append("\nHali birorta savol yechmadingiz. \"📝 Testlar\" tugmasini bosib boshlang!")
+    if threshold is not None:
+        gap = threshold - overall_pct
+        lines.append(f"🔥 Keyingi daraja — {next_label}: yana {gap}% qoldi!")
+    else:
+        lines.append("🏆 Siz eng yuqori darajadasiz! Shu tezlikni davom ettiring 🔥")
 
     await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
@@ -652,12 +779,26 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
         has_next_module = next_module <= total_modules
         paid = db.has_any_confirmed_purchase(user_id)
 
+        # Per-topic breakdown for this module, if questions carry a topic_tag -
+        # reuses the same grouping the assessment test uses, just scoped to
+        # this one attempt instead of the 15-question placement test.
+        breakdown_text = ""
+        breakdown = db.get_assessment_breakdown(attempt["id"])
+        if len(breakdown) > 1:
+            b_lines = ["\n📉 <b>Mavzular bo'yicha natija:</b>"]
+            for row in breakdown:
+                row_pct = int(100 * (row["correct"] or 0) / row["total"]) if row["total"] else 0
+                m = "🔴" if row_pct < 50 else ("🟡" if row_pct < 80 else "🟢")
+                b_lines.append(f"{m} {row['tag']}: {row['correct'] or 0}/{row['total']} ({row_pct}%)")
+            breakdown_text = "\n".join(b_lines)
+
         kb = module_result_keyboard(quiz_id, module_number, attempt["id"], has_next_module)
         label = db.get_module_label(quiz_id, module_number)
         await bot.send_message(
             chat_id,
-            f"{label} tugadi!\nNatija: {score}/{total}",
+            f"{label} tugadi!\nNatija: {score}/{total}{breakdown_text}",
             reply_markup=kb,
+            parse_mode="HTML",
         )
 
         if not paid:
@@ -675,9 +816,19 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
         return
 
     q = questions[idx]
+    q_number = idx - module_start + 1
+    q_total = module_end - module_start
+    bar = progress_bar(q_number - 1, q_total)
+
+    tag_line = ""
+    if q.get("topic_tag"):
+        tag_line = f"📘 {q['topic_tag']}\n"
+    elif q.get("article_number"):
+        tag_line = f"📘 {q['article_number']}-modda\n"
+
     await bot.send_message(
         chat_id,
-        f"Savol {idx - module_start + 1}/{module_end - module_start}:\n\n{q['question_text']}",
+        f"{bar}  {q_number}/{q_total}\n{tag_line}\n{q['question_text']}",
         reply_markup=question_keyboard(quiz_id, idx, q["options"]),
     )
 
@@ -810,10 +961,10 @@ async def on_reyting_button(message: Message, state: FSMContext):
     await send_leaderboard(message.chat.id)
 
 
-@dp.message(F.text == BTN_TARIX)
-async def on_tarix_button(message: Message, state: FSMContext):
+@dp.message(F.text == BTN_PROGRESS)
+async def on_progress_button(message: Message, state: FSMContext):
     await state.clear()
-    await send_history(message.chat.id, message.from_user.id)
+    await send_progress(message.chat.id, message.from_user.id)
 
 
 @dp.message(F.text == BTN_TAKLIF)
@@ -861,7 +1012,7 @@ async def on_ai_button(message: Message, state: FSMContext):
     )
 
 
-_MENU_BUTTON_TEXTS = {BTN_TESTLAR, BTN_TAKLIF, BTN_REYTING, BTN_TARIX, BTN_AI, BTN_TOLOV}
+_MENU_BUTTON_TEXTS = {BTN_TESTLAR, BTN_TAKLIF, BTN_REYTING, BTN_PROGRESS, BTN_AI, BTN_TOLOV}
 
 
 async def send_ai_paywall_prompt(chat_id, user_id):
@@ -1050,10 +1201,17 @@ async def on_daily_answer(callback: CallbackQuery):
     mark = "✅" if correct else "❌"
     await callback.answer("✅ To'g'ri!" if correct else "❌ Noto'g'ri")
 
-    result_text = (
-        f"{mark} {with_db_question['question_text']}\n\n"
-        f"To'g'ri javob: {with_db_question['options'][with_db_question['correct_index']]}\n"
-    )
+    if correct:
+        result_text = (
+            f"{mark} {with_db_question['question_text']}\n\n"
+            f"To'g'ri! Javob: {with_db_question['options'][with_db_question['correct_index']]}\n"
+        )
+    else:
+        result_text = (
+            f"{mark} {with_db_question['question_text']}\n\n"
+            f"Sizning javobingiz: {with_db_question['options'][chosen]}\n"
+            f"To'g'ri javob: {with_db_question['options'][with_db_question['correct_index']]}\n"
+        )
     if with_db_question.get("explanation"):
         result_text += f"\nℹ️ <b>Izoh:</b>\n<blockquote>{with_db_question['explanation']}</blockquote>"
     result_text += "\n\nErtaga yana bepul savol oling! Barcha testlarni ko'rish uchun /start bosing."
@@ -1162,8 +1320,10 @@ async def on_paycard_pressed(callback: CallbackQuery):
 
 @dp.message(F.photo)
 async def on_payment_screenshot(message: Message):
-    # Forward the screenshot to the admin with one-tap confirm/reject buttons.
-    # Find which quiz this user has a pending purchase for.
+    # Forward the screenshot to the admin with one-tap confirm/reject buttons,
+    # plus a quick AI read of the screenshot so the admin can approve faster
+    # without carefully reading every image themselves. The AI note is a
+    # hint only - it never approves anything on its own.
     quiz_id = db.get_pending_quiz_id(message.from_user.id)
     caption = (
         f"To'lov screenshoti\n"
@@ -1175,6 +1335,31 @@ async def on_payment_screenshot(message: Message):
             quiz = db.get_quiz(quiz_id)
             price = db.purchase_price(message.from_user.id, quiz_id) or config.FULL_ACCESS_PRICE_UZS
             caption += f"\nMavzu: {quiz['title']}\nKutilayotgan narx: {price:,} so'm"
+
+            ai_note = ""
+            try:
+                file = await bot.get_file(message.photo[-1].file_id)
+                image_bytes = (await bot.download_file(file.file_path)).read()
+                analysis = await analyze_payment_screenshot(image_bytes, price)
+            except Exception as e:
+                logging.warning(f"Payment screenshot AI analysis failed: {e}")
+                analysis = None
+
+            if analysis:
+                detected = _safe_int(analysis.get("amount_detected"))
+                if not analysis.get("is_payment_screenshot"):
+                    ai_note = "\n🤖 AI: bu to'lov screenshotiga o'xshamayapti ⚠️"
+                elif analysis.get("status_success") is False:
+                    ai_note = "\n🤖 AI: to'lov muvaffaqiyatsiz/bekor ko'rinadi ⚠️"
+                elif detected is not None and detected != price:
+                    ai_note = f"\n🤖 AI: summa {detected:,} so'm ko'rinadi, kutilgan {price:,} bilan mos emas ⚠️"
+                elif analysis.get("status_success") and detected == price:
+                    ai_note = "\n🤖 AI: summa va holat mos keladi ✅"
+                if analysis.get("note"):
+                    ai_note += f"\n💬 {analysis['note']}"
+
+            caption += ai_note
+
             kb = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"confirm:{message.from_user.id}:{quiz_id}"),
                 InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject:{message.from_user.id}:{quiz_id}"),
@@ -1249,12 +1434,19 @@ async def on_answer(callback: CallbackQuery):
     q_number = q_index - module_start + 1
     mark = "✅" if correct else "❌"
 
-    result_text = (
-        f"{mark} <b>{q_number}-savol</b>\n"
-        f"{q['question_text']}\n\n"
-        f"Javobingiz: {q['options'][chosen]}\n"
-        f"To'g'ri javob: {q['options'][q['correct_index']]}\n"
-    )
+    if correct:
+        result_text = (
+            f"{mark} <b>{q_number}-savol</b>\n"
+            f"{q['question_text']}\n\n"
+            f"To'g'ri! Javob: {q['options'][chosen]}\n"
+        )
+    else:
+        result_text = (
+            f"{mark} <b>{q_number}-savol</b>\n"
+            f"{q['question_text']}\n\n"
+            f"Sizning javobingiz: {q['options'][chosen]}\n"
+            f"To'g'ri javob: {q['options'][q['correct_index']]}\n"
+        )
     if q.get("explanation"):
         result_text += f"\nℹ️ <b>Izoh:</b>\n<blockquote>{q['explanation']}</blockquote>"
 

@@ -246,6 +246,98 @@ async def ask_gemini(question: str):
     return None
 
 
+async def ask_gemini_vision(image_bytes: bytes, mime_type: str, prompt: str):
+    """Same idea as ask_gemini but sends an image alongside the text prompt
+    (Gemini's multimodal input). Used to have the AI read a payment
+    screenshot before the admin decides - it never approves anything on its
+    own, it just gives the admin a faster read on what the image shows."""
+    if not config.GEMINI_API_KEY:
+        return None
+
+    import base64
+    b64_image = base64.b64encode(image_bytes).decode("ascii")
+    models_to_try = [config.AI_MODEL, "gemini-2.0-flash", "gemini-1.5-flash"]
+    seen = set()
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": mime_type, "data": b64_image}},
+            ]
+        }]
+    }
+
+    for model in models_to_try:
+        if model in seen:
+            continue
+        seen.add(model)
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={config.GEMINI_API_KEY}"
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, json=payload, timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logging.warning(f"Gemini vision error on model '{model}' ({resp.status}): {body}")
+                        if resp.status in (401, 403):
+                            return None
+                        continue
+                    data = await resp.json()
+                    try:
+                        return data["candidates"][0]["content"]["parts"][0]["text"]
+                    except (KeyError, IndexError, TypeError):
+                        logging.warning(f"Unexpected Gemini vision response from '{model}': {data}")
+                        continue
+        except Exception as e:
+            logging.warning(f"Gemini vision call failed on model '{model}': {e}")
+            continue
+
+    return None
+
+
+def expected_card_last4():
+    digits = "".join(ch for ch in config.CARD_NUMBER if ch.isdigit())
+    return digits[-4:] if len(digits) >= 4 else None
+
+
+async def analyze_payment_screenshot(image_bytes: bytes, mime_type: str):
+    """Asks Gemini vision to read a payment screenshot and return a strict,
+    parseable verdict line ("NATIJA: TASDIQLANDI" / "NATIJA: TASDIQLANMADI")
+    plus the fields it read, so the caller can decide whether to auto-confirm
+    the purchase. The first line is designed to be checked with a plain
+    substring match - see AUTO_APPROVE_TOKEN below."""
+    last4 = expected_card_last4()
+    holder = config.CARD_HOLDER_NAME or "(sozlanmagan)"
+    this_year = str(datetime.date.today().year)
+    prompt = (
+        "Bu to'lov cheki yoki skrinshoti. Rasmni diqqat bilan tekshirib, "
+        "ANIQ shu formatda javob ber (o'zbek tilida, qisqa):\n\n"
+        "NATIJA: TASDIQLANDI\n"
+        "yoki\n"
+        "NATIJA: TASDIQLANMADI\n\n"
+        "Sana: <ko'ringan sana yoki \"topilmadi\">\n"
+        "Qabul qiluvchi: <ism yoki \"topilmadi\">\n"
+        "Karta oxiri: <4 raqam yoki \"topilmadi\">\n"
+        "Summasi: <summa yoki \"topilmadi\">\n"
+        "Sabab: <qisqa izoh>\n\n"
+        f"TASDIQLANDI deb yoz FAQAT quyidagilarning barchasi to'g'ri bo'lsa:\n"
+        f"1) Rasm haqiqiy to'lov cheki/tasdiqnomasiga o'xshaydi (tasodifiy rasm emas)\n"
+        f"2) Karta oxiri aynan {last4 or 'N/A'} raqamlari bilan bir xil\n"
+        f"3) Qabul qiluvchi ismi \"{holder}\" ga mos keladi (kichik imlo farqiga yo'l qo'yiladi)\n"
+        f"4) Sanadagi yil {this_year} bilan bir xil\n\n"
+        "Agar shulardan BIRORTASI mos kelmasa, noaniq bo'lsa, yoki rasmni "
+        "o'qib bo'lmasa - albatta TASDIQLANMADI deb yoz."
+    )
+    return await ask_gemini_vision(image_bytes, mime_type, prompt)
+
+
+AUTO_APPROVE_TOKEN = "NATIJA: TASDIQLANDI"
+
+
 def exam_countdown_line():
     """Big banner shown at the top of /start. Returns '' if EXAM_DATE isn't
     configured yet or is invalid/in the past, so nothing breaks if you haven't
@@ -1171,28 +1263,104 @@ async def on_paycard_pressed(callback: CallbackQuery):
 
 @dp.message(F.photo)
 async def on_payment_screenshot(message: Message):
-    # Forward the screenshot to the admin with one-tap confirm/reject buttons.
     # Find which quiz this user has a pending purchase for.
     quiz_id = db.get_pending_quiz_id(message.from_user.id)
+    user_id = message.from_user.id
     caption = (
         f"To'lov screenshoti\n"
         f"Foydalanuvchi: {message.from_user.full_name} (@{message.from_user.username})\n"
-        f"ID: {message.from_user.id}"
+        f"ID: {user_id}"
     )
+
+    # AI vision read of the screenshot. If it clearly confirms name + card
+    # last4 + year match, the purchase is auto-confirmed with NO admin
+    # action required - this is intentional, per explicit request: fully
+    # automated, no button for the admin to press. If the AI can't verify
+    # (wrong details, unclear image, or Gemini not configured/failing), it
+    # falls back to the normal manual Tasdiqlash/Rad etish flow untouched.
+    ai_analysis = None
+    if config.GEMINI_API_KEY:
+        try:
+            photo = message.photo[-1]
+            file = await bot.get_file(photo.file_id)
+            image_bytes_io = await bot.download_file(file.file_path)
+            image_bytes = image_bytes_io.read()
+            ai_analysis = await analyze_payment_screenshot(image_bytes, "image/jpeg")
+        except Exception as e:
+            logging.warning(f"Payment screenshot AI analysis failed: {e}")
+
+    if ai_analysis:
+        caption += f"\n\n🤖 <b>AI tekshiruvi:</b>\n{ai_analysis}"
+
+    auto_approved = bool(ai_analysis) and AUTO_APPROVE_TOKEN in ai_analysis and quiz_id is not None
+
+    if auto_approved:
+        quiz = db.get_quiz(quiz_id)
+        db.confirm_purchase(user_id, quiz_id)
+        synced = await sync_premium_to_miniweb(user_id, True)
+        sync_note = "" if synced else "\n⚠️ Mini App sinxronlanmadi - /syncpremium bilan qo'lda urinib ko'ring."
+
+        await bot.send_message(
+            user_id,
+            f"✅ To'lovingiz tasdiqlandi!\n\nEndi barcha mavzulardagi testlarga umrbod kirish huquqingiz bor "
+            f"— bot ichida ham, Mini App'da ham.\n\n{TRUST_NOTE}",
+            reply_markup=main_reply_keyboard(paid=True),
+            parse_mode="HTML",
+        )
+
+        if config.ADMIN_ID:
+            price = db.purchase_price(user_id, quiz_id) or config.FULL_ACCESS_PRICE_UZS
+            caption += (
+                f"\n\nMavzu: {quiz['title']}\nNarx: {price:,} so'm"
+                f"\n\n🤖✅ <b>AVTOMATIK TASDIQLANDI</b> - hech qanday amal talab qilinmaydi.{sync_note}"
+            )
+            undo_kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="↩️ Bekor qilish (xato bo'lsa)", callback_data=f"undoauto:{user_id}:{quiz_id}")
+            ]])
+            await bot.send_photo(config.ADMIN_ID, message.photo[-1].file_id, caption=caption, reply_markup=undo_kb, parse_mode="HTML")
+
+        await message.answer("Rahmat! To'lovingiz avtomatik tasdiqlandi. Xush kelibsiz! 🎉")
+        return
+
+    # Fallback: manual review, same as before.
     if config.ADMIN_ID:
         if quiz_id is not None:
             quiz = db.get_quiz(quiz_id)
-            price = db.purchase_price(message.from_user.id, quiz_id) or config.FULL_ACCESS_PRICE_UZS
-            caption += f"\nMavzu: {quiz['title']}\nKutilayotgan narx: {price:,} so'm"
+            price = db.purchase_price(user_id, quiz_id) or config.FULL_ACCESS_PRICE_UZS
+            caption += f"\n\nMavzu: {quiz['title']}\nKutilayotgan narx: {price:,} so'm"
             kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"confirm:{message.from_user.id}:{quiz_id}"),
-                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject:{message.from_user.id}:{quiz_id}"),
+                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"confirm:{user_id}:{quiz_id}"),
+                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject:{user_id}:{quiz_id}"),
             ]])
-            await bot.send_photo(config.ADMIN_ID, message.photo[-1].file_id, caption=caption, reply_markup=kb)
+            await bot.send_photo(config.ADMIN_ID, message.photo[-1].file_id, caption=caption, reply_markup=kb, parse_mode="HTML")
         else:
             caption += "\n\n(Kutilayotgan to'lov topilmadi)"
-            await bot.send_photo(config.ADMIN_ID, message.photo[-1].file_id, caption=caption)
+            await bot.send_photo(config.ADMIN_ID, message.photo[-1].file_id, caption=caption, parse_mode="HTML")
     await message.answer("Rahmat! To'lovingiz tekshirilmoqda, tez orada tasdiqlaymiz.")
+
+
+@dp.callback_query(F.data.startswith("undoauto:"))
+async def on_undo_auto_approve(callback: CallbackQuery):
+    """Lets the admin revoke an auto-approved purchase after the fact, e.g.
+    if a fake screenshot slipped through. Purely optional - never required."""
+    if callback.from_user.id != config.ADMIN_ID:
+        await callback.answer()
+        return
+    _, user_id, quiz_id = callback.data.split(":")
+    user_id, quiz_id = int(user_id), int(quiz_id)
+    db.refund_purchase(user_id, quiz_id)
+    synced = await sync_premium_to_miniweb(user_id, False)
+    sync_note = "" if synced else "\n⚠️ Mini App sinxronlanmadi - /syncpremium bilan qo'lda urinib ko'ring."
+    try:
+        await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n↩️ BEKOR QILINDI" + sync_note)
+    except Exception:
+        pass
+    await bot.send_message(
+        user_id,
+        "Kechirasiz, to'lovingizni qayta tekshirishimiz kerak bo'ldi va kirish huquqingiz vaqtincha bekor qilindi. "
+        f"Savol bo'lsa {config.SUPPORT_USERNAME} ga yozing.",
+    )
+    await callback.answer("Bekor qilindi")
 
 
 @dp.callback_query(F.data.startswith("confirm:"))
@@ -1546,6 +1714,28 @@ async def cmd_onboardingstats(message: Message):
         format_group("⏳ Tayyorgarlik vaqti", stats["prep_time"], PREP_TIME_LABELS),
     ]
     await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("aitest"))
+async def cmd_aitest(message: Message):
+    """Admin: /aitest - instantly checks whether the Gemini API is currently
+    working, without needing to wait for a real user to try the AI button.
+    Useful for a quick health check when you can't be in Telegram much."""
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    if not config.GEMINI_API_KEY:
+        await message.answer("❌ GEMINI_API_KEY sozlanmagan. Railway'da Variables'ni tekshiring.")
+        return
+    checking = await message.answer("🔍 Gemini API tekshirilmoqda...")
+    answer = await ask_gemini("Salom, bu sinov savoli. Faqat 'ishlayapti' deb javob ber.")
+    if answer:
+        await checking.edit_text(f"✅ AI ishlayapti.\n\nJavob namunasi: {answer[:200]}")
+    else:
+        await checking.edit_text(
+            "❌ AI javob bermadi. Railway'dagi Deployments loglarida "
+            "\"Gemini API error\" satrini qidiring va menga yuboring - "
+            "sababi (kalit xato, model xato yoki limit) shu yerda ko'rinadi."
+        )
 
 
 @dp.message(Command("stats"))

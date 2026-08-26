@@ -15,6 +15,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     TelegramObject,
+    BufferedInputFile,
 )
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -1606,6 +1607,52 @@ async def cmd_clearquestions(message: Message, command: CommandObject):
     await message.answer(
         f"🗑️ \"{quiz['title']}\" testidagi {n_before} ta savol o'chirildi.\n"
         f"Endi /bulkadd {quiz_id} orqali fayllarni to'g'ri tartibda qaytadan yuklang."
+    )
+
+
+@dp.message(Command("backupdata"))
+async def cmd_backupdata(message: Message):
+    """Admin: /backupdata - exports every quiz's questions back into the same
+    .txt bulk-upload format (=== separated, with Javob/Izoh/Mavzu lines), and
+    sends it as a downloadable file. Keep a copy of this on your own computer
+    now and then - it's your insurance if the Railway volume is ever lost,
+    separate from just paying your Railway bill on time."""
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    quizzes = db.list_quizzes()
+    if not quizzes:
+        await message.answer("Hozircha hech qanday test yo'q.")
+        return
+
+    parts = []
+    total_questions = 0
+    for quiz in quizzes:
+        questions = db.get_questions(quiz["id"])
+        if not questions:
+            continue
+        parts.append(f"# QUIZ: {quiz['title']} (id={quiz['id']}, narx={quiz['price_uzs']})")
+        for q in questions:
+            block = [q["question_text"]]
+            for i, opt in enumerate(q["options"]):
+                # options already include their "A) " prefix from storage
+                block.append(opt if re.match(r'^[A-D]\)', opt) else f"{chr(65+i)}) {opt}")
+            correct_letter = chr(65 + q["correct_index"])
+            block.append(f"Javob: {correct_letter}")
+            if q.get("explanation"):
+                block.append(f"Izoh: {q['explanation']}")
+            if q.get("topic_tag"):
+                block.append(f"Mavzu: {q['topic_tag']}")
+            parts.append("\n".join(block))
+            total_questions += 1
+        parts.append("===END-OF-QUIZ===")
+
+    backup_text = "\n===\n".join(parts)
+    filename = f"backup_{datetime.date.today().isoformat()}.txt"
+    file = BufferedInputFile(backup_text.encode("utf-8"), filename=filename)
+    await message.answer_document(
+        file,
+        caption=f"📦 Backup: {len(quizzes)} ta test, {total_questions} ta savol. "
+        f"Bu faylni kompyuteringizga saqlab qo'ying.",
     )
 
 

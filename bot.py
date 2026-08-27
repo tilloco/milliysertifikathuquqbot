@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import logging
+import json
 import random
 import re
 
@@ -190,6 +191,56 @@ def main_reply_keyboard(paid=False):
             KeyboardButton(text=BTN_MOCK, web_app=WebAppInfo(url=config.MINIWEB_APP_URL))
         ])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
+async def ask_gemini_stream(question: str):
+    """Async generator: yields the ACCUMULATED answer text as chunks arrive
+    from Gemini's streaming endpoint, so the caller can edit a Telegram
+    message progressively (feels instant, like Claude's own chat) instead of
+    blocking until the whole answer is ready. Yields nothing at all if the
+    stream couldn't be started (missing key, network error, bad status) -
+    the caller should fall back to the plain ask_gemini() in that case."""
+    if not config.GEMINI_API_KEY:
+        return
+
+    model = config.AI_MODEL
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:streamGenerateContent?alt=sse&key={config.GEMINI_API_KEY}"
+    )
+    payload = {
+        "contents": [
+            {"parts": [{"text": f"{AI_SYSTEM_PROMPT}\n\nSavol: {question}"}]}
+        ]
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=60)
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logging.warning(f"Gemini stream error on model '{model}' ({resp.status}): {body}")
+                    return
+
+                accumulated = ""
+                async for raw_line in resp.content:
+                    line = raw_line.decode("utf-8", errors="ignore").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[len("data:"):].strip()
+                    if not data_str or data_str == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(data_str)
+                        text_piece = chunk["candidates"][0]["content"]["parts"][0]["text"]
+                    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                        continue
+                    accumulated += text_piece
+                    yield accumulated
+    except Exception as e:
+        logging.warning(f"Gemini stream call failed on model '{model}': {e}")
+        return
 
 
 async def ask_gemini(question: str):
@@ -1007,20 +1058,51 @@ async def on_ai_question(message: Message, state: FSMContext):
         await send_ai_paywall_prompt(message.chat.id, user_id)
         return
 
-    thinking = await message.answer("🤖 O'ylayapman...")
-    answer = await ask_gemini(message.text)
+    thinking = await message.answer("🤖 ...")
     db.record_ai_message(user_id)
 
-    if answer is None:
+    # Stream the answer in, editing the same message as chunks arrive -
+    # feels instant instead of one long silent wait followed by a wall of
+    # text. Throttled so we don't hit Telegram's edit-rate limits.
+    final_answer = None
+    last_edit_at = 0.0
+    last_shown_text = None
+    loop = asyncio.get_event_loop()
+    EDIT_INTERVAL = 0.6  # seconds between message edits
+
+    async for accumulated in ask_gemini_stream(message.text):
+        final_answer = accumulated
+        now = loop.time()
+        if now - last_edit_at < EDIT_INTERVAL:
+            continue
+        display_text = accumulated + " ▌"
+        if display_text == last_shown_text:
+            continue
+        try:
+            await thinking.edit_text(display_text)
+            last_shown_text = display_text
+            last_edit_at = now
+        except Exception:
+            pass  # e.g. "message not modified" - just wait for the next chunk
+
+    if final_answer is None:
+        # Streaming didn't produce anything (key missing, network error,
+        # stream endpoint down) - fall back to the plain blocking call.
+        final_answer = await ask_gemini(message.text)
+
+    if final_answer is None:
         await thinking.edit_text(
             "Kechirasiz, hozir javob bera olmadim. Birozdan so'ng qayta urinib ko'ring."
         )
         return
 
     try:
-        await thinking.edit_text(answer, parse_mode="HTML")
+        await thinking.edit_text(final_answer, parse_mode="HTML")
     except Exception:
-        await message.answer(answer, parse_mode="HTML")
+        try:
+            await thinking.edit_text(final_answer)
+        except Exception:
+            await message.answer(final_answer)
     # Stay in AIChat.waiting_question so the user can keep asking follow-ups
     # without pressing the button again each time.
 

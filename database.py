@@ -9,6 +9,10 @@ from config import DB_PATH
 MODULE_SIZE = 10
 DAILY_FREE_LIMIT = 10
 
+# Refer this many friends who each go on to start using the bot -> free
+# lifetime full access, no payment needed. See has_referral_free_access().
+REFERRAL_FREE_THRESHOLD = 3
+
 
 @contextmanager
 def get_db():
@@ -77,6 +81,17 @@ def init_db():
             question_id INTEGER NOT NULL,
             selected_index INTEGER NOT NULL,
             is_correct INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS referral_earnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER NOT NULL,
+            referred_user_id INTEGER NOT NULL UNIQUE,
+            quiz_id INTEGER,
+            amount_uzs INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',  -- pending | paid
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            paid_at TEXT
         );
         """)
         cols = [r["name"] for r in db.execute("PRAGMA table_info(quizzes)").fetchall()]
@@ -200,10 +215,6 @@ def record_daily_free_answer(telegram_id):
                 "UPDATE users SET free_answers_count=free_answers_count+1 WHERE telegram_id=?",
                 (telegram_id,),
             )
-
-
-def has_discount(telegram_id, threshold=3):
-    return count_referrals(telegram_id) >= threshold
 
 
 def get_last_daily_date(telegram_id):
@@ -737,13 +748,29 @@ def has_access(user_id, quiz_id):
 
 
 def has_any_confirmed_purchase(user_id):
-    """Global access check: one confirmed payment (for any topic) unlocks every topic."""
+    """Real-payment access check: one confirmed payment (for any topic)
+    unlocks every topic. This does NOT include referral-based free access -
+    use has_full_access() for premium-gating checks; this one stays narrow
+    on purpose so refund-window / "you paid" displays stay accurate."""
     with get_db() as db:
         row = db.execute(
             "SELECT 1 FROM purchases WHERE user_id=? AND status='confirmed' LIMIT 1",
             (user_id,),
         ).fetchone()
         return row is not None
+
+
+def has_referral_free_access(telegram_id, threshold=REFERRAL_FREE_THRESHOLD):
+    """True once someone has referred `threshold` friends (who each started
+    the bot) - unlocks full access without any payment."""
+    return count_referrals(telegram_id) >= threshold
+
+
+def has_full_access(telegram_id):
+    """The one function to use everywhere premium content is gated: true if
+    the user either paid, OR unlocked free access by referring enough
+    friends. Prefer this over has_any_confirmed_purchase for gating."""
+    return has_any_confirmed_purchase(telegram_id) or has_referral_free_access(telegram_id)
 
 
 def has_any_pending_purchase(user_id):
@@ -806,6 +833,76 @@ def get_pending_quiz_id(user_id):
             (user_id,),
         ).fetchone()
         return row["quiz_id"] if row else None
+
+
+# ---------- referral earnings ----------
+
+def get_referred_by(telegram_id):
+    with get_db() as db:
+        row = db.execute("SELECT referred_by FROM users WHERE telegram_id=?", (telegram_id,)).fetchone()
+        return row["referred_by"] if row and row["referred_by"] else None
+
+
+def record_referral_earning(referrer_id, referred_user_id, quiz_id, amount_uzs):
+    """Credits referrer_id for referred_user_id's premium purchase. Credited
+    at most ONCE per referred person, ever - the UNIQUE constraint on
+    referred_user_id blocks a second credit even if that person's purchase
+    is refunded and later reconfirmed. Returns True if a new credit was
+    recorded, False if this person was already credited before (so the
+    caller knows whether to notify the referrer)."""
+    with get_db() as db:
+        try:
+            db.execute(
+                "INSERT INTO referral_earnings (referrer_id, referred_user_id, quiz_id, amount_uzs) "
+                "VALUES (?, ?, ?, ?)",
+                (referrer_id, referred_user_id, quiz_id, amount_uzs),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def get_referral_stats(referrer_id):
+    """How much this referrer has earned: how many paying friends, and how
+    much is still pending payout vs already paid out."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT COUNT(*) AS paying_count, "
+            "COALESCE(SUM(CASE WHEN status='pending' THEN amount_uzs ELSE 0 END), 0) AS pending_uzs, "
+            "COALESCE(SUM(CASE WHEN status='paid' THEN amount_uzs ELSE 0 END), 0) AS paid_uzs "
+            "FROM referral_earnings WHERE referrer_id=?",
+            (referrer_id,),
+        ).fetchone()
+        if not row:
+            return {"paying_count": 0, "pending_uzs": 0, "paid_uzs": 0}
+        return dict(row)
+
+
+def mark_referral_earnings_paid(referrer_id):
+    """Admin calls this AFTER manually sending the referrer their pending
+    balance (e.g. via card transfer)."""
+    with get_db() as db:
+        db.execute(
+            "UPDATE referral_earnings SET status='paid', paid_at=CURRENT_TIMESTAMP "
+            "WHERE referrer_id=? AND status='pending'",
+            (referrer_id,),
+        )
+
+
+def list_pending_referral_payouts():
+    """One row per referrer who has a nonzero pending balance - used by
+    the admin /referrals command."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT re.referrer_id, u.username, u.first_name, "
+            "COUNT(*) AS pending_count, SUM(re.amount_uzs) AS pending_total "
+            "FROM referral_earnings re "
+            "LEFT JOIN users u ON u.telegram_id = re.referrer_id "
+            "WHERE re.status='pending' "
+            "GROUP BY re.referrer_id "
+            "ORDER BY pending_total DESC"
+        ).fetchall()
+        return rows
 
 
 # ---------- leaderboard ----------

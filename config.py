@@ -36,6 +36,12 @@ DB_PATH = os.getenv("DB_PATH", os.path.join(VOLUME_PATH, "lawquiz.db"))
 # One-time price for full access to ALL topics (not per-topic — a single payment unlocks everything).
 FULL_ACCESS_PRICE_UZS = int(os.getenv("FULL_ACCESS_PRICE_UZS", "12000"))
 
+# --- Referral program ---
+# Paid out (manually, by the admin via /payreferral) to whoever's link
+# brought in a friend who goes on to buy premium. Credited once per
+# referred person, ever - see database.record_referral_earning.
+REFERRAL_BONUS_UZS = int(os.getenv("REFERRAL_BONUS_UZS", "5000"))
+
 # --- Mini App sync ---
 # When the admin confirms or refunds a payment here, the bot pings the Mini
 # App's backend so premium status stays in sync on both surfaces automatically.

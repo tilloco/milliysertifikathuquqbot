@@ -1,7 +1,6 @@
 import asyncio
 import datetime
 import logging
-import json
 import random
 import re
 
@@ -104,6 +103,33 @@ async def sync_premium_to_miniweb(telegram_id: int, is_premium: bool) -> bool:
         return False
 
 
+async def credit_referral_bonus(user_id, quiz_id):
+    """Call this right after ANY purchase gets confirmed (manual confirm,
+    admin command, or the AI auto-approve path) - credits whoever referred
+    user_id a flat REFERRAL_BONUS_UZS, but only once per referred person
+    EVER (enforced in the DB, survives refund/reconfirm cycles). Never
+    raises - a failed notify shouldn't break the confirm flow itself."""
+    referrer_id = db.get_referred_by(user_id)
+    if not referrer_id:
+        return
+    credited = db.record_referral_earning(referrer_id, user_id, quiz_id, config.REFERRAL_BONUS_UZS)
+    if not credited:
+        return
+    stats = db.get_referral_stats(referrer_id)
+    total_earned = stats["pending_uzs"] + stats["paid_uzs"]
+    try:
+        await bot.send_message(
+            referrer_id,
+            f"🎉 Tabriklaymiz! Taklif havolangiz orqali kirgan foydalanuvchi premium sotib oldi.\n\n"
+            f"💰 Hisobingizga <b>{config.REFERRAL_BONUS_UZS:,} so'm</b> qo'shildi!\n"
+            f"📊 Jami ishlaganingiz: <b>{total_earned:,} so'm</b> ({stats['paying_count']} ta to'lov qilgan taklif)\n\n"
+            f"To'lovni olish uchun {config.SUPPORT_USERNAME} ga yozing.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logging.warning(f"Referral earning notify failed for {referrer_id}: {e}")
+
+
 class AddQuestion(StatesGroup):
     waiting_quiz_id = State()
     waiting_question = State()
@@ -191,56 +217,6 @@ def main_reply_keyboard(paid=False):
             KeyboardButton(text=BTN_MOCK, web_app=WebAppInfo(url=config.MINIWEB_APP_URL))
         ])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-
-
-async def ask_gemini_stream(question: str):
-    """Async generator: yields the ACCUMULATED answer text as chunks arrive
-    from Gemini's streaming endpoint, so the caller can edit a Telegram
-    message progressively (feels instant, like Claude's own chat) instead of
-    blocking until the whole answer is ready. Yields nothing at all if the
-    stream couldn't be started (missing key, network error, bad status) -
-    the caller should fall back to the plain ask_gemini() in that case."""
-    if not config.GEMINI_API_KEY:
-        return
-
-    model = config.AI_MODEL
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:streamGenerateContent?alt=sse&key={config.GEMINI_API_KEY}"
-    )
-    payload = {
-        "contents": [
-            {"parts": [{"text": f"{AI_SYSTEM_PROMPT}\n\nSavol: {question}"}]}
-        ]
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url, json=payload, timeout=aiohttp.ClientTimeout(total=60)
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logging.warning(f"Gemini stream error on model '{model}' ({resp.status}): {body}")
-                    return
-
-                accumulated = ""
-                async for raw_line in resp.content:
-                    line = raw_line.decode("utf-8", errors="ignore").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[len("data:"):].strip()
-                    if not data_str or data_str == "[DONE]":
-                        continue
-                    try:
-                        chunk = json.loads(data_str)
-                        text_piece = chunk["candidates"][0]["content"]["parts"][0]["text"]
-                    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-                        continue
-                    accumulated += text_piece
-                    yield accumulated
-    except Exception as e:
-        logging.warning(f"Gemini stream call failed on model '{model}': {e}")
-        return
 
 
 async def ask_gemini(question: str):
@@ -355,38 +331,60 @@ def expected_card_last4():
     return digits[-4:] if len(digits) >= 4 else None
 
 
-async def analyze_payment_screenshot(image_bytes: bytes, mime_type: str):
+async def analyze_payment_screenshot(image_bytes: bytes, mime_type: str, expected_price: int):
     """Asks Gemini vision to read a payment screenshot and return a strict,
     parseable verdict line ("NATIJA: TASDIQLANDI" / "NATIJA: TASDIQLANMADI")
     plus the fields it read, so the caller can decide whether to auto-confirm
     the purchase. The first line is designed to be checked with a plain
-    substring match - see AUTO_APPROVE_TOKEN below."""
+    substring match - see AUTO_APPROVE_TOKEN below.
+
+    Deliberately does NOT require a year on the receipt - many bank/Click/
+    Payme checks only show a date or time with no year, so treating a
+    missing year as a rejection reason would wrongly block real payments.
+    Amount IS required to match, though - that wasn't checked before."""
     last4 = expected_card_last4()
     holder = config.CARD_HOLDER_NAME or "(sozlanmagan)"
-    this_year = str(datetime.date.today().year)
     prompt = (
         "Bu to'lov cheki yoki skrinshoti. Rasmni diqqat bilan tekshirib, "
         "ANIQ shu formatda javob ber (o'zbek tilida, qisqa):\n\n"
         "NATIJA: TASDIQLANDI\n"
         "yoki\n"
         "NATIJA: TASDIQLANMADI\n\n"
-        "Sana: <ko'ringan sana yoki \"topilmadi\">\n"
+        "Sana/vaqt: <ko'ringan sana yoki vaqt, yoki \"topilmadi\">\n"
         "Qabul qiluvchi: <ism yoki \"topilmadi\">\n"
         "Karta oxiri: <4 raqam yoki \"topilmadi\">\n"
         "Summasi: <summa yoki \"topilmadi\">\n"
-        "Sabab: <qisqa izoh>\n\n"
+        "Sabab: <TASDIQLANMADI bo'lsa, ANIQ nima sabab ekanini qisqa yoz - "
+        "masalan \"summa mos kelmadi\", \"karta raqami boshqa\", \"chek emas\">\n\n"
         f"TASDIQLANDI deb yoz FAQAT quyidagilarning barchasi to'g'ri bo'lsa:\n"
         f"1) Rasm haqiqiy to'lov cheki/tasdiqnomasiga o'xshaydi (tasodifiy rasm emas)\n"
         f"2) Karta oxiri aynan {last4 or 'N/A'} raqamlari bilan bir xil\n"
         f"3) Qabul qiluvchi ismi \"{holder}\" ga mos keladi (kichik imlo farqiga yo'l qo'yiladi)\n"
-        f"4) Sanadagi yil {this_year} bilan bir xil\n\n"
-        "Agar shulardan BIRORTASI mos kelmasa, noaniq bo'lsa, yoki rasmni "
-        "o'qib bo'lmasa - albatta TASDIQLANMADI deb yoz."
+        f"4) Ko'rsatilgan summa {expected_price:,} so'm bilan bir xil "
+        f"(bank komissiyasi tufayli bir necha yuz so'm farq bo'lsa muammo emas, "
+        f"lekin summa aniq boshqa bo'lsa - TASDIQLANMADI)\n\n"
+        "MUHIM: sananing YILINI tekshirmang - ko'plab cheklarda yil ko'rsatilmaydi, "
+        "bu normal holat va TASDIQLANMADI uchun sabab bo'la olmaydi. Faqat sana/vaqt "
+        "aniq juda eski yoki kelajakdagi ko'rinsa (masalan bir necha oy oldingi sana "
+        "aniq yozilgan bo'lsa), shundagina buni hisobga oling.\n\n"
+        "Agar yuqoridagi 1-4 shartlardan BIRORTASI mos kelmasa, noaniq bo'lsa, yoki "
+        "rasmni o'qib bo'lmasa - albatta TASDIQLANMADI deb yoz va Sabab qatorida "
+        "aniq nimaga ishonch hosil qila olmaganingizni yozing."
     )
     return await ask_gemini_vision(image_bytes, mime_type, prompt)
 
 
 AUTO_APPROVE_TOKEN = "NATIJA: TASDIQLANDI"
+
+
+def extract_ai_reason(ai_text):
+    """Pulls the "Sabab: ..." line out of the AI's structured response, so
+    the user-facing message can tell them roughly why it wasn't approved
+    without dumping the whole raw AI output on them."""
+    if not ai_text:
+        return None
+    m = re.search(r"Sabab:\s*(.+)", ai_text)
+    return m.group(1).strip() if m else None
 
 
 def exam_countdown_line():
@@ -584,7 +582,7 @@ async def start_onboarding(chat_id, state: FSMContext):
 
 
 async def send_welcome_menu(chat_id, user_id):
-    paid = db.has_any_confirmed_purchase(user_id)
+    paid = db.has_full_access(user_id)
     profile = db.get_user_profile(user_id)
     name = profile.get("onboarding_name") if profile else None
     greeting = f"Xush kelibsiz, {name}! 👋" if name else "Xush kelibsiz! 👋"
@@ -616,86 +614,81 @@ def weak_topic_line(user_id):
     )
 
 
-async def send_referral_info(message: Message):
-    bot_info = await bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start={message.from_user.id}"
-    count = db.count_referrals(message.from_user.id)
-    remaining = max(0, 3 - count)
-    if remaining == 0:
-        status = "Tabriklaymiz! Sizga 20% chegirma faollashtirildi. Keyingi to'lovda shu chegirma qo'llanadi."
-    else:
-        status = f"Sizga yana {remaining} ta do'stingiz kerak — 20% chegirma uchun."
-    await message.answer(
-        f"🎁 Do'stlaringizni taklif qiling!\n\n"
-        f"Sizning havolangiz:\n{link}\n\n"
-        f"3 ta do'stingiz botdan foydalansa, keyingi xaridingizga 20% chegirma olasiz.\n\n"
-        f"Hozirgi taklif qilganlar soni: {count}\n{status}"
+def group_promo_text(link):
+    """Ready-to-copy text for the user to paste into groups/channels to
+    promote the bot with their own referral link baked in."""
+    return (
+        "🎯 Milliy sertifikat / DTM imtihoniga eng qulay tayyorgarlik boti!\n\n"
+        "✅ Mavzular bo'yicha testlar\n"
+        "✅ AI yordamchi bilan darhol javob\n"
+        "✅ Har bir savolga batafsil izoh\n"
+        "✅ Progress va zaif tomonlar tahlili\n\n"
+        f"👉 {link}"
     )
 
 
-def topics_keyboard():
-    """Regular topic browser - the assessment test is deliberately excluded
-    here since it's a special one-shot flow (offered after onboarding, or
-    via /darajam), not just another topic to pick and grind through."""
-    kb = InlineKeyboardMarkup(inline_keyboard=[])
-    for q in db.list_quizzes():
-        if q["is_assessment"]:
-            continue
-        kb.inline_keyboard.append([
-            InlineKeyboardButton(text=f"📘 {q['title']}", callback_data=f"topic:{q['id']}")
-        ])
-    return kb
+MONTHLY_BONUS_UZS = 15_000
 
 
-def modules_keyboard(quiz_id, total_modules, completed, daily_locked=False):
-    """daily_locked=True marks every not-yet-completed module with a lock icon
-    (shown when a non-paying user has used up today's free question quota)."""
-    kb = InlineKeyboardMarkup(inline_keyboard=[])
-    for m in range(1, total_modules + 1):
-        if m in completed:
-            mark = " ✅"
-        elif daily_locked:
-            mark = " 🔒"
-        else:
-            mark = ""
-        label = db.get_module_label(quiz_id, m)
-        kb.inline_keyboard.append([
-            InlineKeyboardButton(text=f"{label}{mark}", callback_data=f"module:{quiz_id}:{m}")
-        ])
-    kb.inline_keyboard.append([InlineKeyboardButton(text="📚 Mavzular", callback_data="topics")])
-    return kb
+async def send_rating_and_referral(chat_id, user_id):
+    """One combined, good-looking screen: this month's TOP-3 leaderboard
+    plus everything about the referral program (free-access progress,
+    cash earnings, the personal link) - followed by a separate tap-to-copy
+    message with ready-made group promo text."""
+    bot_info = await bot.get_me()
+    link = f"https://t.me/{bot_info.username}?start={user_id}"
 
-
-def module_result_keyboard(quiz_id, module_number, attempt_id, has_next):
-    buttons = [[InlineKeyboardButton(text="📊 Tahlil", callback_data=f"tahlil:{attempt_id}")]]
-    if has_next:
-        buttons.append([InlineKeyboardButton(
-            text="➡️ Keyingi test", callback_data=f"module:{quiz_id}:{module_number + 1}"
-        )])
-    buttons.append([InlineKeyboardButton(text="📚 Mavzular", callback_data="topics")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-MONTHLY_BONUS_UZS = [150_000, 125_000, 100_000]
-
-
-async def send_leaderboard(chat_id):
+    lines = ["🏆 <b>Shu oylik TOP reyting</b>", ""]
     rows = db.get_leaderboard(limit=10)
     if not rows:
-        await bot.send_message(chat_id, "Hozircha bu oy reytingda hech kim yo'q. Birinchi bo'ling! 🚀")
-        return
-    medals = ["🥇", "🥈", "🥉"]
-    lines = ["🏆 <b>Shu oylik TOP reyting</b> (pullik foydalanuvchilar orasida)\n"]
-    for i, r in enumerate(rows):
-        name = r["first_name"] or (f"@{r['username']}" if r["username"] else f"ID {r['user_id']}")
-        prefix = medals[i] if i < 3 else f"{i + 1}."
-        bonus = f"  — <b>{MONTHLY_BONUS_UZS[i]:,} so'm bonus!</b> 🎁" if i < 3 else ""
-        lines.append(f"{prefix} {name} — {r['total_correct']}/{r['total_answered']} to'g'ri{bonus}")
+        lines.append("Hozircha bu oy reytingda hech kim yo'q. Birinchi bo'ling! 🚀")
+    else:
+        medals = ["🥇", "🥈", "🥉"]
+        for i, r in enumerate(rows):
+            name = r["first_name"] or (f"@{r['username']}" if r["username"] else f"ID {r['user_id']}")
+            prefix = medals[i] if i < 3 else f"{i + 1}."
+            bonus = f"  — <b>{MONTHLY_BONUS_UZS:,} so'm!</b> 🎁" if i < 3 else ""
+            lines.append(f"{prefix} {name} — {r['total_correct']}/{r['total_answered']} to'g'ri{bonus}")
+        lines.append(
+            f"\nOy oxirida TOP-3 ga har biriga <b>{MONTHLY_BONUS_UZS:,} so'm</b> bonus! "
+            "Yangi oy — yangi reyting 🔄"
+        )
+
+    lines.append("\n━━━━━━━━━━━━━━━━━━\n")
+    lines.append("🎁 <b>Do'stlaringizni taklif qiling — pul ishlang!</b>")
+
+    count = db.count_referrals(user_id)
+    has_free = db.has_referral_free_access(user_id)
+    remaining = max(0, db.REFERRAL_FREE_THRESHOLD - count)
+    if has_free:
+        lines.append("✅ 3 ta do'st taklif qildingiz — <b>butun bot sizga umrbod bepul!</b> 🎉")
+    else:
+        lines.append(f"🎯 Yana <b>{remaining} ta</b> do'stingiz kirsa — botga <b>umrbod bepul</b> kirasiz!")
+
+    stats = db.get_referral_stats(user_id)
+    total_earned = stats["pending_uzs"] + stats["paid_uzs"]
     lines.append(
-        "\nOy oxirida TOP-3 aniqlanadi: 1-o'rin 150 000, 2-o'rin 125 000, "
-        "3-o'rin 100 000 so'm bonus oladi. Yangi oy — yangi reyting!"
+        f"💰 Bundan tashqari: taklif qilgan har bir do'stingiz premium sotib olsa — "
+        f"sizga <b>{config.REFERRAL_BONUS_UZS:,} so'm</b> tushadi!"
     )
+    if stats["paying_count"] > 0:
+        lines.append(
+            f"📊 Hozirgacha: <b>{stats['paying_count']}</b> ta to'lov qilgan taklif, "
+            f"jami <b>{total_earned:,} so'm</b> ishladingiz."
+        )
+        if stats["pending_uzs"] > 0:
+            lines.append(f"💵 To'lanishi kutilmoqda: {stats['pending_uzs']:,} so'm — {config.SUPPORT_USERNAME} ga yozing.")
+
+    lines.append(f"\n🔗 Sizning shaxsiy havolangiz:\n<code>{link}</code>")
+    lines.append(f"\nHozirgi taklif qilganlar: <b>{count}</b> ta")
+
     await bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+    await bot.send_message(
+        chat_id,
+        f"📢 <b>Guruhlarga tarqatish uchun tayyor matn</b> (bosib nusxa oling):\n\n"
+        f"<code>{group_promo_text(link)}</code>",
+        parse_mode="HTML",
+    )
 
 
 async def send_history(chat_id, user_id):
@@ -756,10 +749,6 @@ async def send_daily_limit_prompt(chat_id, quiz, user_id):
         await bot.send_message(chat_id, "Bugungi bepul savollaringiz tugadi. To'lovingiz hali tasdiqlanmoqda. Iltimos kuting.")
         return
     price = config.FULL_ACCESS_PRICE_UZS
-    discount_note = ""
-    if db.has_discount(user_id):
-        price = int(price * 0.8)
-        discount_note = " (20% taklif chegirmasi qo'llandi! 🎉)"
     db.request_purchase(user_id, quiz["id"], price_uzs=price)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="💳 To'lash", callback_data=f"paycard:{quiz['id']}")
@@ -771,7 +760,9 @@ async def send_daily_limit_prompt(chat_id, quiz, user_id):
         f"Ertaga yana {db.DAILY_FREE_LIMIT} ta bepul savolga ega bo'lasiz — yoki hoziroq bir martalik "
         f"to'lov bilan <b>barcha mavzulardagi cheksiz testlarga</b> umrbod kirish huquqiga ega bo'ling. "
         f"DTM va milliy sertifikatga eng qulay tayyorgarlik yo'li! 🚀\n\n"
-        f"💰 Narxi: <b>{price:,} so'm</b>{discount_note}\n\n"
+        f"💰 Narxi: <b>{price:,} so'm</b>\n\n"
+        f"🎁 Yoki 3 ta do'stingizni taklif qiling — bot butunlay <b>bepul</b> ochiladi! "
+        f"\"🏆 Reyting\" tugmasidan havolangizni oling.\n\n"
         f"{TRUST_NOTE}",
         reply_markup=kb,
         parse_mode="HTML",
@@ -802,7 +793,7 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
         total_modules = db.count_modules(quiz_id)
         next_module = module_number + 1
         has_next_module = next_module <= total_modules
-        paid = db.has_any_confirmed_purchase(user_id)
+        paid = db.has_full_access(user_id)
 
         kb = module_result_keyboard(quiz_id, module_number, attempt["id"], has_next_module)
         label = db.get_module_label(quiz_id, module_number)
@@ -820,7 +811,7 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
                 await send_daily_limit_prompt(chat_id, quiz, user_id)
         return
 
-    paid = db.has_any_confirmed_purchase(user_id)
+    paid = db.has_full_access(user_id)
     if not quiz["is_assessment"] and not paid and db.get_daily_free_used(user_id) >= db.DAILY_FREE_LIMIT:
         db.finish_attempt(attempt["id"])
         await send_daily_limit_prompt(chat_id, quiz, user_id)
@@ -832,6 +823,49 @@ async def send_question(chat_id, quiz_id, attempt, user_id):
         f"Savol {idx - module_start + 1}/{module_end - module_start}:\n\n{q['question_text']}",
         reply_markup=question_keyboard(quiz_id, idx, q["options"]),
     )
+
+
+def module_result_keyboard(quiz_id, module_number, attempt_id, has_next):
+    buttons = [[InlineKeyboardButton(text="📊 Tahlil", callback_data=f"tahlil:{attempt_id}")]]
+    if has_next:
+        buttons.append([InlineKeyboardButton(
+            text="➡️ Keyingi test", callback_data=f"module:{quiz_id}:{module_number + 1}"
+        )])
+    buttons.append([InlineKeyboardButton(text="📚 Mavzular", callback_data="topics")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def topics_keyboard():
+    """Regular topic browser - the assessment test is deliberately excluded
+    here since it's a special one-shot flow (offered after onboarding, or
+    via /darajam), not just another topic to pick and grind through."""
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for q in db.list_quizzes():
+        if q["is_assessment"]:
+            continue
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text=f"📘 {q['title']}", callback_data=f"topic:{q['id']}")
+        ])
+    return kb
+
+
+def modules_keyboard(quiz_id, total_modules, completed, daily_locked=False):
+    """daily_locked=True marks every not-yet-completed module with a lock icon
+    (shown when a non-paying user has used up today's free question quota)."""
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for m in range(1, total_modules + 1):
+        if m in completed:
+            mark = " ✅"
+        elif daily_locked:
+            mark = " 🔒"
+        else:
+            mark = ""
+        label = db.get_module_label(quiz_id, m)
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text=f"{label}{mark}", callback_data=f"module:{quiz_id}:{m}")
+        ])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="📚 Mavzular", callback_data="topics")])
+    return kb
 
 
 # ---------------- activity tracking middleware ----------------
@@ -959,7 +993,7 @@ async def on_testlar_pressed(message: Message, state: FSMContext):
 @dp.message(F.text == BTN_REYTING)
 async def on_reyting_button(message: Message, state: FSMContext):
     await state.clear()
-    await send_leaderboard(message.chat.id)
+    await send_rating_and_referral(message.chat.id, message.from_user.id)
 
 
 @dp.message(F.text == BTN_TARIX)
@@ -1003,7 +1037,7 @@ async def on_ai_button(message: Message, state: FSMContext):
         )
         return
     user_id = message.from_user.id
-    paid = db.has_any_confirmed_purchase(user_id)
+    paid = db.has_full_access(user_id)
     if not paid and db.get_ai_total_used(user_id) >= config.AI_DAILY_LIMIT:
         await send_ai_paywall_prompt(message.chat.id, user_id)
         return
@@ -1023,10 +1057,6 @@ async def send_ai_paywall_prompt(chat_id, user_id):
     quizzes = db.list_quizzes()
     quiz_id = quizzes[0]["id"] if quizzes else None
     price = config.FULL_ACCESS_PRICE_UZS
-    discount_note = ""
-    if db.has_discount(user_id):
-        price = int(price * 0.8)
-        discount_note = " (20% taklif chegirmasi qo'llandi! 🎉)"
     if quiz_id is not None and not db.has_any_pending_purchase(user_id):
         db.request_purchase(user_id, quiz_id, price_uzs=price)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -1038,7 +1068,9 @@ async def send_ai_paywall_prompt(chat_id, user_id):
         "Premium bilan AI yordamchidan <b>cheksiz</b> foydalanasiz, "
         "shuningdek barcha mavzulardagi testlarga ham umrbod kirish huquqiga "
         "ega bo'lasiz! 🚀\n\n"
-        f"💰 Narxi: <b>{price:,} so'm</b>{discount_note}\n\n"
+        f"💰 Narxi: <b>{price:,} so'm</b>\n\n"
+        f"🎁 Yoki 3 ta do'stingizni taklif qiling — hammasi bepul ochiladi! "
+        f"\"🏆 Reyting\" tugmasidan havolangizni oling.\n\n"
         f"{TRUST_NOTE}",
         reply_markup=kb,
         parse_mode="HTML",
@@ -1052,57 +1084,26 @@ async def on_ai_question(message: Message, state: FSMContext):
         return
 
     user_id = message.from_user.id
-    paid = db.has_any_confirmed_purchase(user_id)
+    paid = db.has_full_access(user_id)
     if not paid and db.get_ai_total_used(user_id) >= config.AI_DAILY_LIMIT:
         await state.clear()
         await send_ai_paywall_prompt(message.chat.id, user_id)
         return
 
-    thinking = await message.answer("🤖 ...")
+    thinking = await message.answer("🤖 O'ylayapman...")
+    answer = await ask_gemini(message.text)
     db.record_ai_message(user_id)
 
-    # Stream the answer in, editing the same message as chunks arrive -
-    # feels instant instead of one long silent wait followed by a wall of
-    # text. Throttled so we don't hit Telegram's edit-rate limits.
-    final_answer = None
-    last_edit_at = 0.0
-    last_shown_text = None
-    loop = asyncio.get_event_loop()
-    EDIT_INTERVAL = 0.6  # seconds between message edits
-
-    async for accumulated in ask_gemini_stream(message.text):
-        final_answer = accumulated
-        now = loop.time()
-        if now - last_edit_at < EDIT_INTERVAL:
-            continue
-        display_text = accumulated + " ▌"
-        if display_text == last_shown_text:
-            continue
-        try:
-            await thinking.edit_text(display_text)
-            last_shown_text = display_text
-            last_edit_at = now
-        except Exception:
-            pass  # e.g. "message not modified" - just wait for the next chunk
-
-    if final_answer is None:
-        # Streaming didn't produce anything (key missing, network error,
-        # stream endpoint down) - fall back to the plain blocking call.
-        final_answer = await ask_gemini(message.text)
-
-    if final_answer is None:
+    if answer is None:
         await thinking.edit_text(
             "Kechirasiz, hozir javob bera olmadim. Birozdan so'ng qayta urinib ko'ring."
         )
         return
 
     try:
-        await thinking.edit_text(final_answer, parse_mode="HTML")
+        await thinking.edit_text(answer, parse_mode="HTML")
     except Exception:
-        try:
-            await thinking.edit_text(final_answer)
-        except Exception:
-            await message.answer(final_answer)
+        await message.answer(answer, parse_mode="HTML")
     # Stay in AIChat.waiting_question so the user can keep asking follow-ups
     # without pressing the button again each time.
 
@@ -1133,14 +1134,22 @@ async def on_tolov_button(message: Message, state: FSMContext):
         )
         return
 
+    if db.has_referral_free_access(user_id):
+        await message.answer(
+            "✅ Siz 3 ta do'stingizni taklif qilib, <b>butun botga bepul kirish huquqiga</b> "
+            "ega bo'lgansiz! Testlardan bemalol foydalaning 🎉\n\n"
+            f"🎁 Eslatma: bundan tashqari, taklif qilgan har bir do'stingiz premium sotib olsa, "
+            f"sizga baribir <b>{config.REFERRAL_BONUS_UZS:,} so'm</b> tushadi — "
+            f"\"🏆 Reyting\" tugmasidan ko'ring.",
+            reply_markup=main_reply_keyboard(paid=True),
+            parse_mode="HTML",
+        )
+        return
+
     quizzes = db.list_quizzes()
     quiz_id = quizzes[0]["id"] if quizzes else None  # one confirmed purchase unlocks every topic
 
     price = config.FULL_ACCESS_PRICE_UZS
-    discount_note = ""
-    if db.has_discount(user_id):
-        price = int(price * 0.8)
-        discount_note = " (20% taklif chegirmasi qo'llandi! 🎉)"
 
     # Make sure there's an open purchase request tied to this user so a
     # screenshot they send afterwards is matched correctly.
@@ -1155,9 +1164,11 @@ async def on_tolov_button(message: Message, state: FSMContext):
     await message.answer(
         f"💳 <b>To'lov ma'lumotlari</b>\n\n"
         f"{payment_card_block()}\n\n"
-        f"💰 Narxi: <b>{price:,} so'm</b>{discount_note}\n\n"
+        f"💰 Narxi: <b>{price:,} so'm</b>\n\n"
         f"To'lov qilgach, screenshotni shu botga rasm qilib yuboring 📸\n\n"
         f"{status_line}\n\n"
+        f"🎁 <b>Bepul variant:</b> 3 ta do'stingizni taklif qiling — botga umrbod bepul kirasiz! "
+        f"\"🏆 Reyting\" tugmasidan havolangizni oling.\n\n"
         f"{TRUST_NOTE}",
         parse_mode="HTML",
     )
@@ -1165,12 +1176,12 @@ async def on_tolov_button(message: Message, state: FSMContext):
 
 @dp.message(Command("reyting"))
 async def cmd_reyting(message: Message):
-    await send_leaderboard(message.chat.id)
+    await send_rating_and_referral(message.chat.id, message.from_user.id)
 
 
 @dp.callback_query(F.data == "leaderboard")
 async def on_leaderboard_pressed(callback: CallbackQuery):
-    await send_leaderboard(callback.message.chat.id)
+    await send_rating_and_referral(callback.message.chat.id, callback.from_user.id)
     await callback.answer()
 
 
@@ -1187,7 +1198,7 @@ async def on_topics_pressed(callback: CallbackQuery):
 
 @dp.message(Command("taklif"))
 async def cmd_referral(message: Message):
-    await send_referral_info(message)
+    await send_rating_and_referral(message.chat.id, message.from_user.id)
 
 
 @dp.message(Command("darajam"))
@@ -1256,7 +1267,7 @@ async def on_topic_selected(callback: CallbackQuery):
     quiz = db.get_quiz(quiz_id)
     user_id = callback.from_user.id
 
-    if db.has_any_pending_purchase(user_id) and not db.has_any_confirmed_purchase(user_id):
+    if db.has_any_pending_purchase(user_id) and not db.has_full_access(user_id):
         await callback.message.answer("To'lovingiz hali tasdiqlanmoqda. Iltimos kuting.")
         await callback.answer()
         return
@@ -1268,7 +1279,7 @@ async def on_topic_selected(callback: CallbackQuery):
         return
 
     completed = db.get_completed_modules(user_id, quiz_id)
-    paid = db.has_any_confirmed_purchase(user_id)
+    paid = db.has_full_access(user_id)
     daily_locked = (not paid) and db.get_daily_free_used(user_id) >= db.DAILY_FREE_LIMIT
     status_line = ""
     if not paid:
@@ -1292,12 +1303,12 @@ async def on_module_selected(callback: CallbackQuery):
     quiz = db.get_quiz(quiz_id)
     user_id = callback.from_user.id
 
-    if db.has_any_pending_purchase(user_id) and not db.has_any_confirmed_purchase(user_id):
+    if db.has_any_pending_purchase(user_id) and not db.has_full_access(user_id):
         await callback.message.answer("To'lovingiz hali tasdiqlanmoqda. Iltimos kuting.")
         await callback.answer()
         return
 
-    if not db.has_any_confirmed_purchase(user_id) and db.get_daily_free_used(user_id) >= db.DAILY_FREE_LIMIT:
+    if not db.has_full_access(user_id) and db.get_daily_free_used(user_id) >= db.DAILY_FREE_LIMIT:
         await send_daily_limit_prompt(callback.message.chat.id, quiz, user_id)
         await callback.answer()
         return
@@ -1354,22 +1365,28 @@ async def on_payment_screenshot(message: Message):
         f"ID: {user_id}"
     )
 
-    # AI vision read of the screenshot. If it clearly confirms name + card
-    # last4 + year match, the purchase is auto-confirmed with NO admin
-    # action required - this is intentional, per explicit request: fully
-    # automated, no button for the admin to press. If the AI can't verify
-    # (wrong details, unclear image, or Gemini not configured/failing), it
-    # falls back to the normal manual Tasdiqlash/Rad etish flow untouched.
+    # AI vision read of the screenshot, checked against the price the user
+    # actually owes. If it clearly confirms name + card last4 + amount match
+    # (year is NOT required - many checks don't show one), the purchase is
+    # auto-confirmed with NO admin action required. If the AI can't verify
+    # (wrong details, unclear image, amount mismatch, or Gemini not
+    # configured/failing), it falls back to the normal manual
+    # Tasdiqlash/Rad etish flow, and the user is told to contact support.
     ai_analysis = None
-    if config.GEMINI_API_KEY:
-        try:
-            photo = message.photo[-1]
-            file = await bot.get_file(photo.file_id)
-            image_bytes_io = await bot.download_file(file.file_path)
-            image_bytes = image_bytes_io.read()
-            ai_analysis = await analyze_payment_screenshot(image_bytes, "image/jpeg")
-        except Exception as e:
-            logging.warning(f"Payment screenshot AI analysis failed: {e}")
+    price = None
+    quiz = None
+    if quiz_id is not None:
+        quiz = db.get_quiz(quiz_id)
+        price = db.purchase_price(user_id, quiz_id) or config.FULL_ACCESS_PRICE_UZS
+        if config.GEMINI_API_KEY:
+            try:
+                photo = message.photo[-1]
+                file = await bot.get_file(photo.file_id)
+                image_bytes_io = await bot.download_file(file.file_path)
+                image_bytes = image_bytes_io.read()
+                ai_analysis = await analyze_payment_screenshot(image_bytes, "image/jpeg", price)
+            except Exception as e:
+                logging.warning(f"Payment screenshot AI analysis failed: {e}")
 
     if ai_analysis:
         caption += f"\n\n🤖 <b>AI tekshiruvi:</b>\n{ai_analysis}"
@@ -1377,8 +1394,8 @@ async def on_payment_screenshot(message: Message):
     auto_approved = bool(ai_analysis) and AUTO_APPROVE_TOKEN in ai_analysis and quiz_id is not None
 
     if auto_approved:
-        quiz = db.get_quiz(quiz_id)
         db.confirm_purchase(user_id, quiz_id)
+        await credit_referral_bonus(user_id, quiz_id)
         synced = await sync_premium_to_miniweb(user_id, True)
         sync_note = "" if synced else "\n⚠️ Mini App sinxronlanmadi - /syncpremium bilan qo'lda urinib ko'ring."
 
@@ -1391,7 +1408,6 @@ async def on_payment_screenshot(message: Message):
         )
 
         if config.ADMIN_ID:
-            price = db.purchase_price(user_id, quiz_id) or config.FULL_ACCESS_PRICE_UZS
             caption += (
                 f"\n\nMavzu: {quiz['title']}\nNarx: {price:,} so'm"
                 f"\n\n🤖✅ <b>AVTOMATIK TASDIQLANDI</b> - hech qanday amal talab qilinmaydi.{sync_note}"
@@ -1404,11 +1420,30 @@ async def on_payment_screenshot(message: Message):
         await message.answer("Rahmat! To'lovingiz avtomatik tasdiqlandi. Xush kelibsiz! 🎉")
         return
 
+    # Not auto-approved - build a message that tells the user what to do
+    # next, including your contact, and the AI's stated reason if it has one.
+    if quiz_id is None:
+        user_msg = (
+            "Rahmat! Screenshotni oldik, lekin sizda faol to'lov so'rovi topilmadi.\n\n"
+            f"Iltimos, {config.SUPPORT_USERNAME} ga murojaat qiling."
+        )
+    elif ai_analysis:
+        reason = extract_ai_reason(ai_analysis)
+        reason_line = f"\n\nSabab: {reason}" if reason else ""
+        user_msg = (
+            "To'lovingizni avtomatik tasdiqlab bo'lmadi." + reason_line +
+            f"\n\nIltimos, chekni tekshirib qaytadan yuboring, yoki to'g'ridan-to'g'ri "
+            f"{config.SUPPORT_USERNAME} ga murojaat qiling — tez orada qo'lda tekshiramiz."
+        )
+    else:
+        user_msg = (
+            "Rahmat! To'lovingiz tekshirilmoqda, tez orada tasdiqlaymiz.\n\n"
+            f"Tezroq javob kerak bo'lsa, {config.SUPPORT_USERNAME} ga yozing."
+        )
+
     # Fallback: manual review, same as before.
     if config.ADMIN_ID:
         if quiz_id is not None:
-            quiz = db.get_quiz(quiz_id)
-            price = db.purchase_price(user_id, quiz_id) or config.FULL_ACCESS_PRICE_UZS
             caption += f"\n\nMavzu: {quiz['title']}\nKutilayotgan narx: {price:,} so'm"
             kb = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"confirm:{user_id}:{quiz_id}"),
@@ -1418,13 +1453,16 @@ async def on_payment_screenshot(message: Message):
         else:
             caption += "\n\n(Kutilayotgan to'lov topilmadi)"
             await bot.send_photo(config.ADMIN_ID, message.photo[-1].file_id, caption=caption, parse_mode="HTML")
-    await message.answer("Rahmat! To'lovingiz tekshirilmoqda, tez orada tasdiqlaymiz.")
+    await message.answer(user_msg, parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("undoauto:"))
 async def on_undo_auto_approve(callback: CallbackQuery):
     """Lets the admin revoke an auto-approved purchase after the fact, e.g.
-    if a fake screenshot slipped through. Purely optional - never required."""
+    if a fake screenshot slipped through. Purely optional - never required.
+    Note: this does NOT claw back a referral bonus that was already
+    credited to whoever referred this user - handle that manually if it
+    turns out to matter."""
     if callback.from_user.id != config.ADMIN_ID:
         await callback.answer()
         return
@@ -1453,6 +1491,7 @@ async def on_confirm_pressed(callback: CallbackQuery):
     _, user_id, quiz_id = callback.data.split(":")
     user_id, quiz_id = int(user_id), int(quiz_id)
     db.confirm_purchase(user_id, quiz_id)
+    await credit_referral_bonus(user_id, quiz_id)
     synced = await sync_premium_to_miniweb(user_id, True)
     sync_note = "" if synced else "\n⚠️ Mini App sinxronlanmadi - /syncpremium buyrug'i bilan qo'lda urinib ko'ring."
     await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ TASDIQLANDI" + sync_note)
@@ -1497,7 +1536,7 @@ async def on_answer(callback: CallbackQuery):
 
     db.record_answer(attempt["id"], q["id"], chosen, correct)
     db.advance_attempt(attempt["id"], correct)
-    if not db.has_any_confirmed_purchase(user_id) and not db.is_assessment_quiz(quiz_id):
+    if not db.has_full_access(user_id) and not db.is_assessment_quiz(quiz_id):
         db.record_daily_free_answer(user_id)
 
     # Small toast that auto-dismisses - no blocking popup to interrupt them.
@@ -1607,6 +1646,7 @@ async def cmd_confirm(message: Message, command: CommandObject):
         return
     user_id, quiz_id = int(parts[0]), int(parts[1])
     db.confirm_purchase(user_id, quiz_id)
+    await credit_referral_bonus(user_id, quiz_id)
     synced = await sync_premium_to_miniweb(user_id, True)
     sync_note = "" if synced else "\n⚠️ Mini App sinxronlanmadi - /syncpremium bilan qo'lda urinib ko'ring."
     await message.answer(f"Tasdiqlandi: user {user_id}, quiz {quiz_id}{sync_note}")
@@ -1704,6 +1744,56 @@ async def cmd_pending(message: Message):
             f"   Tasdiqlash: /confirm {r['user_id']} {r['quiz_id']}\n"
         )
     await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("referrals"))
+async def cmd_referrals(message: Message):
+    """Admin: /referrals - lists everyone who is currently owed a referral
+    payout (pending, not yet paid), with a ready /payreferral command for each."""
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    rows = db.list_pending_referral_payouts()
+    if not rows:
+        await message.answer("✅ To'lanadigan referral bonuslar yo'q.")
+        return
+    lines = ["💰 <b>To'lanishi kerak bo'lgan referral bonuslar:</b>\n"]
+    for r in rows:
+        name = r["first_name"] or (f"@{r['username']}" if r["username"] else "Noma'lum")
+        lines.append(
+            f"👤 {name} (ID: {r['referrer_id']})\n"
+            f"   {r['pending_count']} ta to'lov qilgan taklif — {r['pending_total']:,} so'm\n"
+            f"   To'lash: /payreferral {r['referrer_id']}\n"
+        )
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("payreferral"))
+async def cmd_payreferral(message: Message, command: CommandObject):
+    """Admin: /payreferral <user_id> - marks this user's pending referral
+    earnings as paid, AFTER you've manually sent them the money (e.g. card
+    transfer). Doesn't move money itself - just clears the pending balance
+    and notifies them."""
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    if not command.args or not command.args.strip().isdigit():
+        await message.answer("Foydalanish: /payreferral <user_id>")
+        return
+    referrer_id = int(command.args.strip())
+    stats = db.get_referral_stats(referrer_id)
+    if stats["pending_uzs"] <= 0:
+        await message.answer("Bu foydalanuvchida to'lanadigan referral bonusi yo'q.")
+        return
+    pending = stats["pending_uzs"]
+    db.mark_referral_earnings_paid(referrer_id)
+    await message.answer(f"✅ {pending:,} so'm to'langan deb belgilandi (user {referrer_id}).")
+    try:
+        await bot.send_message(
+            referrer_id,
+            f"💸 Referral bonusingiz — <b>{pending:,} so'm</b> — to'landi. Rahmat! 🎉",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
 
 
 @dp.message(Command("resetuser"))

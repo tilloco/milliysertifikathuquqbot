@@ -2025,7 +2025,30 @@ async def cmd_backupdata(message: Message):
         caption=f"📦 Backup: {len(quizzes)} ta test, {total_questions} ta savol. "
         f"Bu faylni kompyuteringizga saqlab qo'ying.",
     )
-
+@dp.message(Command("testreminder"))
+async def cmd_testreminder(message: Message):
+    """Admin: /testreminder - manually triggers the inactivity reminder job
+    right now, instead of waiting for the hourly schedule, and reports how
+    many users were found/messaged."""
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    checking = await message.answer("🔍 Ishga tushirilmoqda...")
+    inactive_ids = db.get_inactive_users(hours=config.INACTIVITY_REMINDER_HOURS)
+    sent, failed = 0, 0
+    for telegram_id in inactive_ids:
+        line = random.choice(MOTIVATIONAL_LINES)
+        try:
+            await bot.send_message(
+                telegram_id,
+                f"👋 Sizni sog'indik!\n\n{line}\n\nDavom etish uchun pastdagi \"📝 Testlar\" tugmasini bosing yoki /start yozing.",
+            )
+            db.mark_reminder_sent(telegram_id)
+            sent += 1
+        except Exception as e:
+            logging.warning(f"Test reminder failed for {telegram_id}: {e}")
+            db.mark_reminder_sent(telegram_id)
+            failed += 1
+    await checking.edit_text(f"✅ Tugadi.\n\nTopildi: {len(inactive_ids)}\nYuborildi: {sent}\nXato: {failed}")
 
 @dp.message(Command("listquizzes"))
 async def cmd_listquizzes(message: Message):

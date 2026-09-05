@@ -219,6 +219,68 @@ def main_reply_keyboard(paid=False):
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
+# ---------------- mandatory channel subscription ----------------
+
+async def is_subscribed(user_id: int) -> bool:
+    """True if user_id is currently a member/admin/creator of
+    config.REQUIRED_CHANNEL_ID. If the check itself fails (most likely
+    cause: the bot hasn't been added as an admin of that channel, or the
+    channel id/username is wrong), this fails OPEN (returns True) and just
+    logs a warning - a misconfigured channel shouldn't lock every user out
+    of the whole bot. Flip the `return True` in the except block to
+    `return False` if you'd rather fail closed once you've confirmed the
+    bot is set up correctly in the channel."""
+    if not config.REQUIRED_CHANNEL_ID:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=config.REQUIRED_CHANNEL_ID, user_id=user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as e:
+        logging.warning(f"Subscription check failed for {user_id}: {e}")
+        return True
+
+
+def subscribe_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=config.REQUIRED_CHANNEL_URL)],
+        [InlineKeyboardButton(text="✅ Tekshirish", callback_data="checksub")],
+    ])
+
+
+async def send_subscribe_prompt(chat_id):
+    await bot.send_message(
+        chat_id,
+        "📢 Botdan foydalanish uchun avval quyidagi kanalga obuna bo'ling:\n\n"
+        f"{config.REQUIRED_CHANNEL_URL}\n\n"
+        "Obuna bo'lgach, pastdagi \"✅ Tekshirish\" tugmasini bosing 👇",
+        reply_markup=subscribe_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "checksub")
+async def on_check_subscription(callback: CallbackQuery, state: FSMContext):
+    subscribed = await is_subscribed(callback.from_user.id)
+    if not subscribed:
+        await callback.answer(
+            "Hali obuna bo'lmagansiz. Iltimos avval kanalga obuna bo'ling.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer("✅ Obuna tasdiqlandi!")
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    user_id = callback.from_user.id
+    db.upsert_user(user_id, callback.from_user.username, callback.from_user.first_name)
+    if not db.has_completed_onboarding(user_id):
+        await start_onboarding(callback.message.chat.id, state)
+    else:
+        await send_welcome_menu(callback.message.chat.id, user_id)
+
+
 async def ask_gemini(question: str):
     """Returns the AI's answer as text, or None if the call failed (missing
     key, network error, bad response, etc.) - caller shows a friendly
@@ -886,6 +948,51 @@ class ActivityMiddleware:
 
 
 dp.update.outer_middleware(ActivityMiddleware())
+
+
+class SubscriptionMiddleware:
+    """Blocks every handler for a user who hasn't joined config.REQUIRED_CHANNEL_ID,
+    showing a subscribe prompt instead. The admin (config.ADMIN_ID) is always
+    exempt, and the "✅ Tekshirish" callback itself is always let through so a
+    non-subscribed user can actually press it to re-check."""
+
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        if not config.REQUIRED_CHANNEL_ID:
+            return await handler(event, data)
+
+        user = None
+        chat_id = None
+        is_check_callback = False
+
+        if getattr(event, "message", None) is not None:
+            user = event.message.from_user
+            chat_id = event.message.chat.id
+        elif getattr(event, "callback_query", None) is not None:
+            user = event.callback_query.from_user
+            chat_id = event.callback_query.message.chat.id if event.callback_query.message else None
+            is_check_callback = event.callback_query.data == "checksub"
+
+        if user is None or user.id == config.ADMIN_ID or is_check_callback:
+            return await handler(event, data)
+
+        subscribed = await is_subscribed(user.id)
+        if subscribed:
+            return await handler(event, data)
+
+        if getattr(event, "callback_query", None) is not None:
+            try:
+                await event.callback_query.answer(
+                    "Avval kanalga obuna bo'ling.", show_alert=True
+                )
+            except Exception:
+                pass
+
+        if chat_id is not None:
+            await send_subscribe_prompt(chat_id)
+        return  # block: don't call the actual handler
+
+
+dp.update.outer_middleware(SubscriptionMiddleware())
 
 
 # ---------------- user commands ----------------

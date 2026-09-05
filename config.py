@@ -8,6 +8,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
 # Get it by messaging @userinfobot on Telegram.
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
+# --- Mandatory subscription gate ---
+# Users must be a member of this channel to use the bot at all.
+# IMPORTANT: the bot must be added as an ADMIN of this channel, otherwise
+# Telegram won't let it check membership status and the check will fail
+# (currently configured to fail-open in that case — see is_subscribed()).
+# REQUIRED_CHANNEL_ID is what's passed to the Bot API (accepts @username or
+# a numeric -100... chat id). REQUIRED_CHANNEL_URL is the link shown to users.
+REQUIRED_CHANNEL_ID = os.getenv("REQUIRED_CHANNEL_ID", "@mamun2bytillo_co")
+REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL", "https://t.me/mamun2bytillo_co")
+
 # Card number / phone shown to buyers for Click/Payme/card transfer.
 PAYMENT_INSTRUCTIONS = os.getenv(
     "PAYMENT_INSTRUCTIONS",

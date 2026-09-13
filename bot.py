@@ -210,15 +210,16 @@ def parse_bulk_questions(text):
 
 def main_reply_keyboard(paid=False):
     """Single 'To'lov' button always shown - it doubles as purchase entry point
-    and payment-status check, whether or not the user has paid yet.
-    BTN_TESTLAR now opens Mock exams directly (see on_testlar_pressed) - the
-    old Mini App web_app button (BTN_MOCK) has been removed since regular
-    users never used a slash command reliably; everything is button-driven now."""
+    and payment-status check, whether or not the user has paid yet."""
     keyboard = [
         [KeyboardButton(text=BTN_TESTLAR), KeyboardButton(text=BTN_TAKLIF)],
         [KeyboardButton(text=BTN_REYTING), KeyboardButton(text=BTN_TARIX)],
         [KeyboardButton(text=BTN_AI), KeyboardButton(text=BTN_TOLOV)],
     ]
+    if config.MINIWEB_APP_URL:
+        keyboard.append([
+            KeyboardButton(text=BTN_MOCK, web_app=WebAppInfo(url=config.MINIWEB_APP_URL))
+        ])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
@@ -950,26 +951,19 @@ def mock_exams_keyboard(user_id):
     return kb
 
 
-async def send_mocktests_menu(chat_id, user_id):
-    """Shared by both the BTN_TESTLAR button and the /mocktests command
-    (kept as a fallback/alias) so the menu never drifts out of sync."""
+@dp.message(Command("mocktests"))
+async def cmd_mocktests(message: Message):
     mocks = db.list_mock_quizzes()
     if not mocks:
-        await bot.send_message(chat_id, "Hozircha testlar mavjud emas. Tez orada qo'shiladi!")
+        await message.answer("Hozircha mock imtihonlar mavjud emas.")
         return
-    await bot.send_message(
-        chat_id,
+    await message.answer(
         "🎯 <b>Mock imtihonlar</b>\n\nHar biri 45 ta savol, imtihon rejimida "
         "(javoblar barcha savollardan keyin, oxirida ko'rsatiladi). Birinchi "
         "imtihon bepul, qolganlari premium bilan ochiladi 👇",
-        reply_markup=mock_exams_keyboard(user_id),
+        reply_markup=mock_exams_keyboard(message.from_user.id),
         parse_mode="HTML",
     )
-
-
-@dp.message(Command("mocktests"))
-async def cmd_mocktests(message: Message):
-    await send_mocktests_menu(message.chat.id, message.from_user.id)
 
 
 @dp.callback_query(F.data.startswith("mockstart:"))
@@ -1342,11 +1336,12 @@ async def on_onboarding_time(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(F.text == BTN_TESTLAR)
 async def on_testlar_pressed(message: Message, state: FSMContext):
-    """BTN_TESTLAR now opens Mock exams (button-driven, no command needed) -
-    same content as /mocktests, kept as one shared function so both stay
-    in sync."""
     await state.clear()
-    await send_mocktests_menu(message.chat.id, message.from_user.id)
+    quizzes = db.list_quizzes()
+    if not quizzes:
+        await message.answer("Hozircha testlar mavjud emas. Tez orada qo'shiladi!")
+        return
+    await message.answer("Mavzuni tanlang 👇", reply_markup=topics_keyboard())
 
 
 @dp.message(F.text == BTN_REYTING)

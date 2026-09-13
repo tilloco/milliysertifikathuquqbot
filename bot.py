@@ -137,7 +137,7 @@ class AddQuestion(StatesGroup):
     waiting_correct = State()
     waiting_explanation = State()
     waiting_bulk_file = State()
-    class ExamAnswer(StatesGroup):
+class ExamAnswer(StatesGroup):
     waiting_written = State()
 
 

@@ -146,7 +146,7 @@ def init_db():
         qzcols = [r["name"] for r in db.execute("PRAGMA table_info(quizzes)").fetchall()]
         if "is_assessment" not in qzcols:
             db.execute("ALTER TABLE quizzes ADD COLUMN is_assessment INTEGER DEFAULT 0")
-                    qzcols2 = [r["name"] for r in db.execute("PRAGMA table_info(quizzes)").fetchall()]
+        qzcols2 = [r["name"] for r in db.execute("PRAGMA table_info(quizzes)").fetchall()]
         if "is_mock" not in qzcols2:
             db.execute("ALTER TABLE quizzes ADD COLUMN is_mock INTEGER DEFAULT 0")
         if "is_free_preview" not in qzcols2:

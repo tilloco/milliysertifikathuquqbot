@@ -137,6 +137,8 @@ class AddQuestion(StatesGroup):
     waiting_correct = State()
     waiting_explanation = State()
     waiting_bulk_file = State()
+    class ExamAnswer(StatesGroup):
+    waiting_written = State()
 
 
 class Feedback(StatesGroup):
@@ -200,6 +202,198 @@ def parse_bulk_questions(text):
             "topic_tag": topic_tag,
         })
     return questions
+def mock_exams_keyboard(user_id):
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for q in db.list_mock_quizzes():
+        n = db.count_questions(q["id"])
+        locked = "" if (q["is_free_preview"] or db.has_full_access(user_id)) else " 🔒"
+        free_tag = " (BEPUL)" if q["is_free_preview"] else ""
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text=f"📝 {q['title']}{free_tag}{locked} — {n} savol",
+                                  callback_data=f"mockstart:{q['id']}")
+        ])
+    return kb
+
+
+@dp.message(Command("mocktests"))
+async def cmd_mocktests(message: Message):
+    mocks = db.list_mock_quizzes()
+    if not mocks:
+        await message.answer("Hozircha mock imtihonlar mavjud emas.")
+        return
+    await message.answer(
+        "🎯 <b>Mock imtihonlar</b>\n\nHar biri 45 ta savol, imtihon rejimida "
+        "(javoblar oxirida ko'rsatiladi). Birinchi imtihon bepul, qolganlari "
+        "premium bilan ochiladi 👇",
+        reply_markup=mock_exams_keyboard(message.from_user.id),
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("mockstart:"))
+async def on_mock_start(callback: CallbackQuery, state: FSMContext):
+    quiz_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+    quiz = db.get_quiz(quiz_id)
+
+    if not db.can_access_mock(user_id, quiz_id):
+        price = config.FULL_ACCESS_PRICE_UZS
+        if not db.has_any_pending_purchase(user_id):
+            db.request_purchase(user_id, quiz_id, price_uzs=price)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="💳 To'lash", callback_data=f"paycard:{quiz_id}")
+        ]])
+        await callback.message.answer(
+            f"🔒 Bu mock imtihon premium bilan ochiladi.\n\n💰 Narxi: <b>{price:,} so'm</b>\n\n{TRUST_NOTE}",
+            reply_markup=kb, parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    attempt_id = db.start_exam_attempt(user_id, quiz_id)
+    await callback.message.answer(
+        f"📝 <b>{quiz['title']}</b> boshlandi!\n\n"
+        f"⚠️ Bu imtihon rejimi: har bir savoldan keyin javob ko'rsatilmaydi. "
+        f"Barcha savollarni tugatgach, umumiy natija va tahlilni ko'rasiz.",
+        parse_mode="HTML",
+    )
+    await send_exam_question(callback.message.chat.id, quiz_id, attempt_id, state)
+    await callback.answer()
+
+
+async def send_exam_question(chat_id, quiz_id, attempt_id, state: FSMContext):
+    with db.get_db() as conn:
+        attempt = conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+    questions = db.get_questions(quiz_id)
+    idx = attempt["current_index"]
+
+    if idx >= len(questions):
+        await finish_exam(chat_id, quiz_id, attempt_id)
+        return
+
+    db.touch_attempt_activity(attempt_id)
+    q = questions[idx]
+    header = f"Savol {idx + 1}/{len(questions)}:\n\n{q['question_text']}"
+
+    if q["question_type"] == "written":
+        await state.set_state(ExamAnswer.waiting_written)
+        await state.update_data(exam_attempt_id=attempt_id, exam_quiz_id=quiz_id, exam_question_id=q["id"])
+        await bot.send_message(chat_id, f"{header}\n\n✍️ Javobingizni matn ko'rinishida yozing.")
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=opt, callback_data=f"examans:{attempt_id}:{q['id']}:{i}")]
+            for i, opt in enumerate(q["options"])
+        ])
+        await bot.send_message(chat_id, header, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("examans:"))
+async def on_exam_answer(callback: CallbackQuery, state: FSMContext):
+    _, attempt_id, question_id, chosen = callback.data.split(":")
+    attempt_id, question_id, chosen = int(attempt_id), int(question_id), int(chosen)
+
+    with db.get_db() as conn:
+        attempt = conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+    if attempt is None or attempt["finished"]:
+        await callback.answer("Bu savol eskirgan.")
+        return
+
+    q = db.get_question_by_id(question_id)
+    correct = (chosen == q["correct_index"])
+    db.record_answer(attempt_id, question_id, chosen, correct)
+    db.advance_attempt(attempt_id, correct)
+
+    await callback.answer("Javob qabul qilindi ✅")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await send_exam_question(callback.message.chat.id, attempt["quiz_id"], attempt_id, state)
+
+
+async def grade_written_answer(question_text, expected_answer, user_answer):
+    """Uses Gemini to judge a free-text answer against the expected one,
+    tolerant of spelling/typo mistakes - judges MEANING, not exact wording."""
+    prompt = (
+        "Quyida savol, kutilgan to'g'ri javob va foydalanuvchi javobi berilgan. "
+        "Imlo xatolarga (masalan, harflar aralashib ketishi) e'tibor bermang - "
+        "faqat MA'NO to'g'ri yoki noto'g'riligini baholang.\n\n"
+        f"Savol: {question_text}\n"
+        f"Kutilgan javob: {expected_answer}\n"
+        f"Foydalanuvchi javobi: {user_answer}\n\n"
+        "Faqat bitta so'z bilan javob ber: TOGRI yoki NOTOGRI"
+    )
+    result = await ask_gemini(prompt)
+    if result is None:
+        return False  # fail closed if AI unavailable - admin can review via backup/logs
+    return "TOGRI" in result.upper().replace("'", "").replace("‘", "")
+
+
+@dp.message(StateFilter(ExamAnswer.waiting_written), ~F.text.in_(_MENU_BUTTON_TEXTS))
+async def on_exam_written_answer(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Iltimos, javobni matn ko'rinishida yozing.")
+        return
+    data = await state.get_data()
+    attempt_id = data["exam_attempt_id"]
+    quiz_id = data["exam_quiz_id"]
+    question_id = data["exam_question_id"]
+
+    q = db.get_question_by_id(question_id)
+    thinking = await message.answer("🤖 Javob tekshirilmoqda...")
+    correct = await grade_written_answer(q["question_text"], q.get("expected_answer") or "", message.text)
+    db.record_written_answer(attempt_id, question_id, message.text, correct)
+    db.advance_attempt(attempt_id, correct)
+    await thinking.edit_text("Javob qabul qilindi ✅" if correct else "Javob qabul qilindi.")
+
+    await state.clear()
+    await send_exam_question(message.chat.id, quiz_id, attempt_id, state)
+
+
+async def finish_exam(chat_id, quiz_id, attempt_id):
+    db.finish_attempt(attempt_id)
+    quiz = db.get_quiz(quiz_id)
+    result = db.get_exam_result(attempt_id)
+    total, correct = result["total"], result["correct"]
+    pct = round(100 * correct / total, 1) if total else 0
+    grade = db.compute_grade(pct)
+    grade_line = f"🏅 Taxminiy daraja: <b>{grade}</b>" if grade else "🏅 Hozircha hech qanday sertifikat darajasiga yetmadingiz."
+
+    await bot.send_message(
+        chat_id,
+        f"🏁 <b>{quiz['title']} yakunlandi!</b>\n\n"
+        f"✅ Natija: <b>{correct}/{total}</b> ({pct}%)\n"
+        f"{grade_line}\n\n"
+        f"⚠️ Bu taxminiy baho - rasmiy Milliy sertifikat Rash modeli asosida hisoblanadi, "
+        f"bu yerda oddiy foiz bo'yicha hisoblandi.\n\n"
+        f"Batafsil tahlil uchun pastdagi tugmani bosing 👇",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📊 To'liq tahlil", callback_data=f"examreview:{attempt_id}")
+        ]]),
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("examreview:"))
+async def on_exam_review(callback: CallbackQuery):
+    attempt_id = int(callback.data.split(":")[1])
+    review = db.get_exam_review(attempt_id)
+    lines = ["📊 <b>Javoblar tahlili</b>\n"]
+    for i, a in enumerate(review, 1):
+        mark = "✅" if a["is_correct"] else "❌"
+        lines.append(f"{i}. {a['question_text']}")
+        lines.append(f"Javobingiz: {a['selected_text']} {mark}")
+        if not a["is_correct"]:
+            lines.append(f"To'g'ri javob: {a['correct_text']}")
+        if a["explanation"]:
+            lines.append(f"ℹ️ {a['explanation']}")
+        lines.append("")
+    text = "\n".join(lines)
+    # Telegram messages cap at 4096 chars - split into chunks if long.
+    for i in range(0, len(text), 3500):
+        await callback.message.answer(text[i:i+3500], parse_mode="HTML")
+    await callback.answer()
 
 
 # ---------------- helpers ----------------
@@ -2327,74 +2521,33 @@ async def addq_got_question(message: Message, state: FSMContext):
 
 
 @dp.message(StateFilter(AddQuestion.waiting_options))
-async def addq_got_options(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Iltimos, variantlarni matn ko'rinishida yuboring.")
-        return
-    options = [line.strip() for line in message.text.split("\n") if line.strip()]
-    if len(options) < 2:
-        await message.answer("Kamida 2 ta variant kerak. Qaytadan yuboring (har biri alohida qatorda).")
-        return
-    await state.update_data(options=options)
-    await state.set_state(AddQuestion.waiting_correct)
-    numbered = "\n".join(f"{i+1}. {opt}" for i, opt in enumerate(options))
-    await message.answer(f"Qaysi variant to'g'ri? Raqamini yuboring:\n\n{numbered}")
+def lock_free_preview_access(user_id, quiz_id):
+    """Revokes this user's free-preview access to this specific quiz after
+    they abandoned it past the paywall window. Uses a dedicated table so it
+    never collides with the real purchases table (which the payment flow
+    anchors to quizzes[0]["id"] - could accidentally be the same quiz_id)."""
+    with get_db() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO mock_locks (user_id, quiz_id) VALUES (?, ?)",
+            (user_id, quiz_id),
+        )
 
 
-@dp.message(StateFilter(AddQuestion.waiting_correct))
-async def addq_got_correct(message: Message, state: FSMContext):
-    data = await state.get_data()
-    options = data["options"]
-    if not message.text or not message.text.strip().isdigit():
-        await message.answer("Iltimos, faqat raqam yuboring.")
-        return
-    correct_num = int(message.text.strip())
-    if correct_num < 1 or correct_num > len(options):
-        await message.answer(f"1 dan {len(options)} gacha raqam yuboring.")
-        return
+def is_free_preview_locked(user_id, quiz_id):
+    with get_db() as db:
+        row = db.execute(
+            "SELECT 1 FROM mock_locks WHERE user_id=? AND quiz_id=?",
+            (user_id, quiz_id),
+        ).fetchone()
+        return row is not None
 
-    await state.update_data(correct_num=correct_num)
-    await state.set_state(AddQuestion.waiting_explanation)
-    await message.answer(
-        "Endi izoh yozing (nega bu javob to'g'ri — foydalanuvchi javobdan keyin ko'radi).\n"
-        "Izoh kerak bo'lmasa, - (chiziqcha) yuboring."
-    )
-
-
-@dp.message(StateFilter(AddQuestion.waiting_explanation))
-async def addq_got_explanation(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Iltimos, izoh matnini yoki - yuboring.")
-        return
-    data = await state.get_data()
-    explanation = None if message.text.strip() == "-" else message.text.strip()
-
-    quiz_id = data["quiz_id"]
-    order_index = db.count_questions(quiz_id)
-    db.add_question(
-        quiz_id=quiz_id,
-        question_text=data["question_text"],
-        options=data["options"],
-        correct_index=data["correct_num"] - 1,
-        order_index=order_index,
-        explanation=explanation,
-    )
-    await state.update_data(question_text=None, options=None, correct_num=None)
-    await state.set_state(AddQuestion.waiting_question)
-    total = db.count_questions(quiz_id)
-    await message.answer(
-        f"✅ Savol qo'shildi! (Jami: {total} ta)\n\n"
-        f"Yana savol qo'shish uchun savol matnini yuboring, "
-        f"yoki /done deb yozib tugating."
-    )
-
-
-# ---------------- entrypoint ----------------
 
 async def main():
     db.init_db()
 
     scheduler = AsyncIOScheduler()
+    scheduler.add_job(send_exam_reminders, "interval", hours=1)
+
     # Checked hourly; a user only gets pinged once per inactivity crossing
     # (see get_inactive_users), so an hourly check just controls how soon
     # after the 24h mark they hear from us - not how often they're pinged.

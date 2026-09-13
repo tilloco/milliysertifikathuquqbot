@@ -163,7 +163,13 @@ def parse_bulk_questions(text):
     """Parse a '===' separated block of questions into a list of dicts.
     An optional 'Mavzu: <tag>' line (any position) tags the question with
     which topic/branch it represents - used by the assessment test to
-    report per-branch weak points."""
+    report per-branch weak points.
+
+    Supports two question types:
+    - MCQ (default): has A)/B)/C)/D) option lines and a 'Javob: <letter>' line.
+    - Written: has a 'Turi: yozma' line and a 'Kutilgan javob: <text>' line
+      instead of options/Javob - used for mock-exam written questions,
+      graded later by AI (see grade_written_answer in bot.py)."""
     option_pattern = re.compile(r'^[A-D]\)\s*')
     questions = []
     for block in text.split("==="):
@@ -173,6 +179,8 @@ def parse_bulk_questions(text):
         question_lines, options, explanation_lines = [], [], []
         correct_index = None
         topic_tag = None
+        question_type = "mcq"
+        expected_answer = None
         mode = "question"
         for line in lines:
             if option_pattern.match(line):
@@ -182,6 +190,14 @@ def parse_bulk_questions(text):
                 letter = line.split(":", 1)[1].strip().upper()
                 if letter:
                     correct_index = ord(letter[0]) - ord('A')
+                mode = "after_javob"
+            elif line.lower().startswith("turi:"):
+                type_val = line.split(":", 1)[1].strip().lower()
+                if type_val in ("yozma", "written"):
+                    question_type = "written"
+                mode = "question"
+            elif line.lower().startswith("kutilgan javob:"):
+                expected_answer = line.split(":", 1)[1].strip()
                 mode = "after_javob"
             elif line.lower().startswith("izoh:"):
                 mode = "explanation"
@@ -194,14 +210,22 @@ def parse_bulk_questions(text):
                 question_lines.append(line)
             elif mode == "explanation":
                 explanation_lines.append(line)
-        if not options or correct_index is None or not question_lines:
+        if not question_lines:
             continue
+        if question_type == "written":
+            if not expected_answer:
+                continue
+        else:
+            if not options or correct_index is None:
+                continue
         questions.append({
             "question_text": "\n".join(question_lines).strip(),
             "options": options,
-            "correct_index": correct_index,
+            "correct_index": correct_index if correct_index is not None else -1,
             "explanation": "\n".join(explanation_lines).strip() or None,
             "topic_tag": topic_tag,
+            "question_type": question_type,
+            "expected_answer": expected_answer,
         })
     return questions
 
@@ -210,16 +234,15 @@ def parse_bulk_questions(text):
 
 def main_reply_keyboard(paid=False):
     """Single 'To'lov' button always shown - it doubles as purchase entry point
-    and payment-status check, whether or not the user has paid yet."""
+    and payment-status check, whether or not the user has paid yet.
+    BTN_TESTLAR now opens Mock exams directly (see on_testlar_pressed) - the
+    old Mini App web_app button (BTN_MOCK) has been removed since regular
+    users never used a slash command reliably; everything is button-driven now."""
     keyboard = [
         [KeyboardButton(text=BTN_TESTLAR), KeyboardButton(text=BTN_TAKLIF)],
         [KeyboardButton(text=BTN_REYTING), KeyboardButton(text=BTN_TARIX)],
         [KeyboardButton(text=BTN_AI), KeyboardButton(text=BTN_TOLOV)],
     ]
-    if config.MINIWEB_APP_URL:
-        keyboard.append([
-            KeyboardButton(text=BTN_MOCK, web_app=WebAppInfo(url=config.MINIWEB_APP_URL))
-        ])
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
@@ -951,19 +974,26 @@ def mock_exams_keyboard(user_id):
     return kb
 
 
-@dp.message(Command("mocktests"))
-async def cmd_mocktests(message: Message):
+async def send_mocktests_menu(chat_id, user_id):
+    """Shared by both the BTN_TESTLAR button and the /mocktests command
+    (kept as a fallback/alias) so the menu never drifts out of sync."""
     mocks = db.list_mock_quizzes()
     if not mocks:
-        await message.answer("Hozircha mock imtihonlar mavjud emas.")
+        await bot.send_message(chat_id, "Hozircha testlar mavjud emas. Tez orada qo'shiladi!")
         return
-    await message.answer(
+    await bot.send_message(
+        chat_id,
         "🎯 <b>Mock imtihonlar</b>\n\nHar biri 45 ta savol, imtihon rejimida "
         "(javoblar barcha savollardan keyin, oxirida ko'rsatiladi). Birinchi "
         "imtihon bepul, qolganlari premium bilan ochiladi 👇",
-        reply_markup=mock_exams_keyboard(message.from_user.id),
+        reply_markup=mock_exams_keyboard(user_id),
         parse_mode="HTML",
     )
+
+
+@dp.message(Command("mocktests"))
+async def cmd_mocktests(message: Message):
+    await send_mocktests_menu(message.chat.id, message.from_user.id)
 
 
 @dp.callback_query(F.data.startswith("mockstart:"))
@@ -1336,12 +1366,11 @@ async def on_onboarding_time(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(F.text == BTN_TESTLAR)
 async def on_testlar_pressed(message: Message, state: FSMContext):
+    """BTN_TESTLAR now opens Mock exams (button-driven, no command needed) -
+    same content as /mocktests, kept as one shared function so both stay
+    in sync."""
     await state.clear()
-    quizzes = db.list_quizzes()
-    if not quizzes:
-        await message.answer("Hozircha testlar mavjud emas. Tez orada qo'shiladi!")
-        return
-    await message.answer("Mavzuni tanlang 👇", reply_markup=topics_keyboard())
+    await send_mocktests_menu(message.chat.id, message.from_user.id)
 
 
 @dp.message(F.text == BTN_REYTING)
@@ -2523,6 +2552,8 @@ async def addq_got_bulk_file(message: Message, state: FSMContext):
             order_index=start_index + i,
             explanation=q["explanation"],
             topic_tag=q.get("topic_tag"),
+            question_type=q.get("question_type", "mcq"),
+            expected_answer=q.get("expected_answer"),
         )
     total = db.count_questions(quiz_id)
     await state.clear()

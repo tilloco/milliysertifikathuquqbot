@@ -146,33 +146,18 @@ def init_db():
         qzcols = [r["name"] for r in db.execute("PRAGMA table_info(quizzes)").fetchall()]
         if "is_assessment" not in qzcols:
             db.execute("ALTER TABLE quizzes ADD COLUMN is_assessment INTEGER DEFAULT 0")
-        qzcols2 = [r["name"] for r in db.execute("PRAGMA table_info(quizzes)").fetchall()]
-        if "is_mock" not in qzcols2:
+        if "is_mock" not in qzcols:
             db.execute("ALTER TABLE quizzes ADD COLUMN is_mock INTEGER DEFAULT 0")
-        if "is_free_preview" not in qzcols2:
+        if "is_free_preview" not in qzcols:
             db.execute("ALTER TABLE quizzes ADD COLUMN is_free_preview INTEGER DEFAULT 0")
-
-        qcols3 = [r["name"] for r in db.execute("PRAGMA table_info(questions)").fetchall()]
-        if "question_type" not in qcols3:
-            db.execute("ALTER TABLE questions ADD COLUMN question_type TEXT DEFAULT 'mcq'")
-        if "expected_answer" not in qcols3:
-            db.execute("ALTER TABLE questions ADD COLUMN expected_answer TEXT")
-
-        acols2 = [r["name"] for r in db.execute("PRAGMA table_info(attempts)").fetchall()]
-        if "mode" not in acols2:
-            db.execute("ALTER TABLE attempts ADD COLUMN mode TEXT DEFAULT 'practice'")
-        if "last_activity_at" not in acols2:
-            db.execute("ALTER TABLE attempts ADD COLUMN last_activity_at TEXT")
-        if "reminder_stage" not in acols2:
-            db.execute("ALTER TABLE attempts ADD COLUMN reminder_stage INTEGER DEFAULT 0")
-
-        aacols = [r["name"] for r in db.execute("PRAGMA table_info(attempt_answers)").fetchall()]
-        if "written_text" not in aacols:
-            db.execute("ALTER TABLE attempt_answers ADD COLUMN written_text TEXT")
 
         qcols2 = [r["name"] for r in db.execute("PRAGMA table_info(questions)").fetchall()]
         if "topic_tag" not in qcols2:
             db.execute("ALTER TABLE questions ADD COLUMN topic_tag TEXT")
+        if "question_type" not in qcols2:
+            db.execute("ALTER TABLE questions ADD COLUMN question_type TEXT DEFAULT 'mcq'")
+        if "expected_answer" not in qcols2:
+            db.execute("ALTER TABLE questions ADD COLUMN expected_answer TEXT")
 
         pcols = [r["name"] for r in db.execute("PRAGMA table_info(purchases)").fetchall()]
         if "price_uzs" not in pcols:
@@ -183,6 +168,16 @@ def init_db():
         acols = [r["name"] for r in db.execute("PRAGMA table_info(attempts)").fetchall()]
         if "module_number" not in acols:
             db.execute("ALTER TABLE attempts ADD COLUMN module_number INTEGER DEFAULT 1")
+        if "mode" not in acols:
+            db.execute("ALTER TABLE attempts ADD COLUMN mode TEXT DEFAULT 'practice'")
+        if "last_activity_at" not in acols:
+            db.execute("ALTER TABLE attempts ADD COLUMN last_activity_at TEXT")
+        if "reminder_stage" not in acols:
+            db.execute("ALTER TABLE attempts ADD COLUMN reminder_stage INTEGER DEFAULT 0")
+
+        aacols = [r["name"] for r in db.execute("PRAGMA table_info(attempt_answers)").fetchall()]
+        if "written_text" not in aacols:
+            db.execute("ALTER TABLE attempt_answers ADD COLUMN written_text TEXT")
 
 
 # ---------- users ----------
@@ -516,7 +511,7 @@ def quiz_popularity():
 
 def list_quizzes():
     with get_db() as db:
-        return db.execute("SELECT * FROM quizzes ORDER BY id").fetchall()
+        return db.execute("SELECT * FROM quizzes WHERE is_mock=0 ORDER BY id").fetchall()
 
 
 def get_quiz(quiz_id):
@@ -646,6 +641,7 @@ def _extract_article_number(text):
     m = _ARTICLE_RE.search(text or "")
     return int(m.group(1)) if m else None
 
+
 def add_question(quiz_id, question_text, options, correct_index, order_index=0, explanation=None,
                   article_number=None, topic_tag=None, question_type="mcq", expected_answer=None):
     if article_number is None:
@@ -668,7 +664,7 @@ def get_questions(quiz_id):
         result = []
         for r in rows:
             d = dict(r)
-            d["options"] = json.loads(d["options"])
+            d["options"] = json.loads(d["options"]) if d["options"] else []
             result.append(d)
         return result
 
@@ -692,6 +688,197 @@ def delete_questions_for_quiz(quiz_id):
     """Admin helper: wipe every question for a quiz so it can be re-uploaded in clean order."""
     with get_db() as db:
         db.execute("DELETE FROM questions WHERE quiz_id=?", (quiz_id,))
+
+
+# ---------- mock exams ----------
+
+def add_mock_quiz(title, description, price_uzs, is_free_preview=False):
+    """Same table as regular quizzes, just flagged is_mock=1. free_questions
+    is irrelevant for mock exams (gating uses is_free_preview + has_full_access
+    instead), so it's set to 0. Excluded from list_quizzes() so it never
+    shows up in the regular topic browser."""
+    with get_db() as db:
+        cur = db.execute(
+            "INSERT INTO quizzes (title, description, price_uzs, free_questions, is_mock, is_free_preview) "
+            "VALUES (?, ?, ?, 0, 1, ?)",
+            (title, description, price_uzs, 1 if is_free_preview else 0),
+        )
+        return cur.lastrowid
+
+
+def list_mock_quizzes():
+    with get_db() as db:
+        return db.execute("SELECT * FROM quizzes WHERE is_mock=1 ORDER BY id").fetchall()
+
+
+def is_mock_quiz(quiz_id):
+    with get_db() as db:
+        row = db.execute("SELECT is_mock FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
+        return bool(row and row["is_mock"])
+
+
+def is_free_preview_quiz(quiz_id):
+    with get_db() as db:
+        row = db.execute("SELECT is_free_preview FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
+        return bool(row and row["is_free_preview"])
+
+
+def lock_free_preview_access(user_id, quiz_id):
+    """Revokes this user's free-preview access to this specific quiz after
+    they abandoned it past the paywall window. Uses a dedicated table so it
+    never collides with the real purchases table (which the payment flow
+    anchors to quizzes[0]["id"] - could accidentally be the same quiz_id)."""
+    with get_db() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO mock_locks (user_id, quiz_id) VALUES (?, ?)",
+            (user_id, quiz_id),
+        )
+
+
+def is_free_preview_locked(user_id, quiz_id):
+    with get_db() as db:
+        row = db.execute(
+            "SELECT 1 FROM mock_locks WHERE user_id=? AND quiz_id=?",
+            (user_id, quiz_id),
+        ).fetchone()
+        return row is not None
+
+
+def can_access_mock(user_id, quiz_id):
+    if has_full_access(user_id):
+        return True
+    if is_free_preview_quiz(quiz_id) and not is_free_preview_locked(user_id, quiz_id):
+        return True
+    return False
+
+
+def start_exam_attempt(user_id, quiz_id):
+    """Like start_attempt but mode='exam' (no per-question feedback), always
+    starts at index 0 covering the WHOLE quiz (mock exams aren't split into
+    10-question modules)."""
+    now = datetime.datetime.utcnow().isoformat()
+    with get_db() as db:
+        old = db.execute(
+            "SELECT id FROM attempts WHERE user_id=? AND quiz_id=? AND finished=0",
+            (user_id, quiz_id),
+        ).fetchall()
+        for row in old:
+            db.execute("DELETE FROM attempt_answers WHERE attempt_id=?", (row["id"],))
+        db.execute(
+            "DELETE FROM attempts WHERE user_id=? AND quiz_id=? AND finished=0",
+            (user_id, quiz_id),
+        )
+        cur = db.execute(
+            "INSERT INTO attempts (user_id, quiz_id, current_index, score, module_number, mode, last_activity_at) "
+            "VALUES (?, ?, 0, 0, 1, 'exam', ?)",
+            (user_id, quiz_id, now),
+        )
+        return cur.lastrowid
+
+
+def touch_attempt_activity(attempt_id):
+    now = datetime.datetime.utcnow().isoformat()
+    with get_db() as db:
+        db.execute(
+            "UPDATE attempts SET last_activity_at=?, reminder_stage=0 WHERE id=?",
+            (now, attempt_id),
+        )
+
+
+def record_written_answer(attempt_id, question_id, written_text, is_correct):
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO attempt_answers (attempt_id, question_id, selected_index, is_correct, written_text) "
+            "VALUES (?, ?, -1, ?, ?)",
+            (attempt_id, question_id, 1 if is_correct else 0, written_text),
+        )
+
+
+def get_exam_result(attempt_id):
+    """Total/correct across BOTH mcq and written answers for one exam attempt."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT COUNT(*) AS total, SUM(is_correct) AS correct "
+            "FROM attempt_answers WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        total = row["total"] or 0
+        correct = row["correct"] or 0
+        return {"total": total, "correct": correct}
+
+
+def get_exam_review(attempt_id):
+    """Full answer-key style review: every question, what the user answered,
+    the correct answer, and explanation - for both mcq and written questions."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT aa.selected_index, aa.is_correct, aa.written_text, "
+            "q.question_text, q.options, q.correct_index, q.explanation, "
+            "q.question_type, q.expected_answer "
+            "FROM attempt_answers aa JOIN questions q ON q.id = aa.question_id "
+            "WHERE aa.attempt_id=? ORDER BY aa.id",
+            (attempt_id,),
+        ).fetchall()
+        result = []
+        for r in rows:
+            if r["question_type"] == "written":
+                result.append({
+                    "question_text": r["question_text"],
+                    "selected_text": r["written_text"],
+                    "correct_text": r["expected_answer"],
+                    "is_correct": bool(r["is_correct"]),
+                    "explanation": r["explanation"],
+                    "question_type": "written",
+                })
+            else:
+                opts = json.loads(r["options"]) if r["options"] else []
+                result.append({
+                    "question_text": r["question_text"],
+                    "selected_text": opts[r["selected_index"]] if 0 <= r["selected_index"] < len(opts) else "-",
+                    "correct_text": opts[r["correct_index"]] if 0 <= r["correct_index"] < len(opts) else "-",
+                    "is_correct": bool(r["is_correct"]),
+                    "explanation": r["explanation"],
+                    "question_type": "mcq",
+                })
+        return result
+
+
+def compute_grade(pct):
+    """pct is 0-100. Returns the matching letter grade string, or None if
+    below every band's cutoff (i.e. no certificate level reached)."""
+    from config import GRADE_BANDS
+    for cutoff, label in GRADE_BANDS:
+        if pct >= cutoff:
+            return label
+    return None
+
+
+def get_stalled_exam_attempts(hours, stage):
+    """Exam-mode attempts inactive for >= `hours` that haven't yet been
+    reminded at this stage (0 = first reminder, 1 = already reminded once)."""
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(hours=hours)).isoformat()
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT a.id AS attempt_id, a.user_id, a.quiz_id, q.title AS quiz_title, q.is_free_preview "
+            "FROM attempts a JOIN quizzes q ON q.id = a.quiz_id "
+            "WHERE a.mode='exam' AND a.finished=0 AND a.reminder_stage=? "
+            "AND a.last_activity_at IS NOT NULL AND a.last_activity_at <= ?",
+            (stage, cutoff),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_exam_reminder_sent(attempt_id, stage):
+    with get_db() as db:
+        db.execute("UPDATE attempts SET reminder_stage=? WHERE id=?", (stage, attempt_id))
+
+
+def lock_exam_attempt(attempt_id):
+    """Called when a mock exam's attempt has gone unanswered past the
+    paywall threshold - marks it finished so resuming forces a fresh start
+    (which will hit the normal can_access_mock paywall check)."""
+    with get_db() as db:
+        db.execute("UPDATE attempts SET finished=1 WHERE id=?", (attempt_id,))
 
 
 # ---------- purchases ----------
@@ -1029,202 +1216,16 @@ def get_attempt_answers(attempt_id):
         ).fetchall()
         result = []
         for r in rows:
-            opts = json.loads(r["options"])
+            opts = json.loads(r["options"]) if r["options"] else []
             result.append({
                 "question_text": r["question_text"],
-                "selected_text": opts[r["selected_index"]],
-                "correct_text": opts[r["correct_index"]],
+                "selected_text": opts[r["selected_index"]] if 0 <= r["selected_index"] < len(opts) else "-",
+                "correct_text": opts[r["correct_index"]] if 0 <= r["correct_index"] < len(opts) else "-",
                 "is_correct": bool(r["is_correct"]),
                 "explanation": r["explanation"],
             })
         return result
-# ---------- mock exams ----------
 
-def add_mock_quiz(title, description, price_uzs, is_free_preview=False):
-    """Same table as regular quizzes, just flagged is_mock=1. free_questions
-    is irrelevant for mock exams (gating uses is_free_preview + has_full_access
-    instead), so it's set to 0."""
-    with get_db() as db:
-        cur = db.execute(
-            "INSERT INTO quizzes (title, description, price_uzs, free_questions, is_mock, is_free_preview) "
-            "VALUES (?, ?, ?, 0, 1, ?)",
-            (title, description, price_uzs, 1 if is_free_preview else 0),
-        )
-        return cur.lastrowid
-
-
-def list_mock_quizzes():
-    with get_db() as db:
-        return db.execute("SELECT * FROM quizzes WHERE is_mock=1 ORDER BY id").fetchall()
-
-
-def is_mock_quiz(quiz_id):
-    with get_db() as db:
-        row = db.execute("SELECT is_mock FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
-        return bool(row and row["is_mock"])
-
-
-def is_free_preview_quiz(quiz_id):
-    with get_db() as db:
-        row = db.execute("SELECT is_free_preview FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
-        return bool(row and row["is_free_preview"])
-
-
-def lock_free_preview_access(user_id, quiz_id):
-    """Revokes this user's free-preview access to this specific quiz after
-    they abandoned it past the paywall window. Other users' free access is
-    untouched - this is per-user, not a global flag on the quiz."""
-    with get_db() as db:
-        db.execute(
-            "INSERT INTO purchases (user_id, quiz_id, status) VALUES (?, ?, 'locked') "
-            "ON CONFLICT(user_id, quiz_id) DO UPDATE SET status='locked'",
-            (user_id, quiz_id),
-        )
-
-
-def is_free_preview_locked(user_id, quiz_id):
-    with get_db() as db:
-        row = db.execute(
-            "SELECT 1 FROM purchases WHERE user_id=? AND quiz_id=? AND status='locked'",
-            (user_id, quiz_id),
-        ).fetchone()
-        return row is not None
-
-
-def can_access_mock(user_id, quiz_id):
-    if has_full_access(user_id):
-        return True
-    if is_free_preview_quiz(quiz_id) and not is_free_preview_locked(user_id, quiz_id):
-        return True
-    return False
-
-def start_exam_attempt(user_id, quiz_id):
-    """Like start_attempt but mode='exam' (no per-question feedback), always
-    starts at index 0 covering the WHOLE quiz (mock exams aren't split into
-    10-question modules)."""
-    now = datetime.datetime.utcnow().isoformat()
-    with get_db() as db:
-        old = db.execute(
-            "SELECT id FROM attempts WHERE user_id=? AND quiz_id=? AND finished=0",
-            (user_id, quiz_id),
-        ).fetchall()
-        for row in old:
-            db.execute("DELETE FROM attempt_answers WHERE attempt_id=?", (row["id"],))
-        db.execute(
-            "DELETE FROM attempts WHERE user_id=? AND quiz_id=? AND finished=0",
-            (user_id, quiz_id),
-        )
-        cur = db.execute(
-            "INSERT INTO attempts (user_id, quiz_id, current_index, score, module_number, mode, last_activity_at) "
-            "VALUES (?, ?, 0, 0, 1, 'exam', ?)",
-            (user_id, quiz_id, now),
-        )
-        return cur.lastrowid
-
-
-def touch_attempt_activity(attempt_id):
-    now = datetime.datetime.utcnow().isoformat()
-    with get_db() as db:
-        db.execute(
-            "UPDATE attempts SET last_activity_at=?, reminder_stage=0 WHERE id=?",
-            (now, attempt_id),
-        )
-
-
-def record_written_answer(attempt_id, question_id, written_text, is_correct):
-    with get_db() as db:
-        db.execute(
-            "INSERT INTO attempt_answers (attempt_id, question_id, selected_index, is_correct, written_text) "
-            "VALUES (?, ?, -1, ?, ?)",
-            (attempt_id, question_id, 1 if is_correct else 0, written_text),
-        )
-
-
-def get_exam_result(attempt_id):
-    """Total/correct across BOTH mcq and written answers for one exam attempt."""
-    with get_db() as db:
-        row = db.execute(
-            "SELECT COUNT(*) AS total, SUM(is_correct) AS correct "
-            "FROM attempt_answers WHERE attempt_id=?",
-            (attempt_id,),
-        ).fetchone()
-        total = row["total"] or 0
-        correct = row["correct"] or 0
-        return {"total": total, "correct": correct}
-
-
-def get_exam_review(attempt_id):
-    """Full answer-key style review: every question, what the user answered,
-    the correct answer, and explanation - for both mcq and written questions."""
-    with get_db() as db:
-        rows = db.execute(
-            "SELECT aa.selected_index, aa.is_correct, aa.written_text, "
-            "q.question_text, q.options, q.correct_index, q.explanation, "
-            "q.question_type, q.expected_answer "
-            "FROM attempt_answers aa JOIN questions q ON q.id = aa.question_id "
-            "WHERE aa.attempt_id=? ORDER BY aa.id",
-            (attempt_id,),
-        ).fetchall()
-        result = []
-        for r in rows:
-            if r["question_type"] == "written":
-                result.append({
-                    "question_text": r["question_text"],
-                    "selected_text": r["written_text"],
-                    "correct_text": r["expected_answer"],
-                    "is_correct": bool(r["is_correct"]),
-                    "explanation": r["explanation"],
-                    "question_type": "written",
-                })
-            else:
-                opts = json.loads(r["options"])
-                result.append({
-                    "question_text": r["question_text"],
-                    "selected_text": opts[r["selected_index"]],
-                    "correct_text": opts[r["correct_index"]],
-                    "is_correct": bool(r["is_correct"]),
-                    "explanation": r["explanation"],
-                    "question_type": "mcq",
-                })
-        return result
-
-
-def compute_grade(pct):
-    """pct is 0-100. Returns the matching letter grade string, or None if
-    below every band's cutoff (i.e. no certificate level reached)."""
-    from config import GRADE_BANDS
-    for cutoff, label in GRADE_BANDS:
-        if pct >= cutoff:
-            return label
-    return None
-
-
-def get_stalled_exam_attempts(hours, stage):
-    """Exam-mode attempts inactive for >= `hours` that haven't yet been
-    reminded at this stage (0 = first reminder, 1 = already reminded once)."""
-    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(hours=hours)).isoformat()
-    with get_db() as db:
-        rows = db.execute(
-            "SELECT a.id AS attempt_id, a.user_id, a.quiz_id, q.title AS quiz_title, q.is_free_preview "
-            "FROM attempts a JOIN quizzes q ON q.id = a.quiz_id "
-            "WHERE a.mode='exam' AND a.finished=0 AND a.reminder_stage=? "
-            "AND a.last_activity_at IS NOT NULL AND a.last_activity_at <= ?",
-            (stage, cutoff),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-
-def mark_exam_reminder_sent(attempt_id, stage):
-    with get_db() as db:
-        db.execute("UPDATE attempts SET reminder_stage=? WHERE id=?", (stage, attempt_id))
-
-
-def lock_exam_attempt(attempt_id):
-    """Called when a paid mock exam's attempt has gone unanswered past the
-    paywall threshold - marks it finished so resuming forces a fresh start
-    (which will hit the normal has_full_access paywall check)."""
-    with get_db() as db:
-        db.execute("UPDATE attempts SET finished=1 WHERE id=?", (attempt_id,))
 
 def get_completed_modules(user_id, quiz_id):
     """Module numbers the user has fully answered (not just paywall-cut-short)."""
@@ -1248,3 +1249,30 @@ def get_completed_modules(user_id, quiz_id):
             if module_size > 0 and answered >= module_size:
                 completed.add(r["module_number"])
         return completed
+
+
+def list_questions_brief(quiz_id):
+    """Short id + first-line preview of every question in a quiz - used by
+    /listquestions so the admin can find a question's id before deleting it,
+    without dumping the full question text of everything."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT id, question_text, question_type FROM questions "
+            "WHERE quiz_id=? ORDER BY order_index, id",
+            (quiz_id,),
+        ).fetchall()
+        result = []
+        for r in rows:
+            first_line = r["question_text"].split("\n")[0]
+            preview = first_line[:60] + ("..." if len(first_line) > 60 else "")
+            result.append({"id": r["id"], "preview": preview, "question_type": r["question_type"]})
+        return result
+
+
+def delete_question(question_id):
+    """Admin helper: permanently deletes ONE question by its id (unlike
+    delete_questions_for_quiz, which wipes an entire quiz). Returns True if
+    a row was actually deleted, False if that id didn't exist."""
+    with get_db() as db:
+        cur = db.execute("DELETE FROM questions WHERE id=?", (question_id,))
+        return cur.rowcount > 0

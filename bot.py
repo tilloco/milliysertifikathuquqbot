@@ -679,8 +679,10 @@ async def send_welcome_menu(chat_id, user_id):
         chat_id,
         f"{exam_countdown_line()}"
         f"{greeting}\n\n"
-        "Bu yerda DTM va Milliy sertifikatga eng qulay tarzda tayyorlanasiz — "
-        "mavzu bo'yicha testlar, shaxsiy tahlil va AI yordamchi bilan.\n\n"
+        "Bu yerda Milliy sertifikat imtihonini <b>haqiqiy sharoitda</b> sinab ko'rasiz — "
+        "45 savoldan iborat to'liq mock imtihonlar, real vaqt bosimi, va imtihon "
+        "oxirida aniq ball + taxminiy sertifikat darajangiz (A+, A, B+...).\n\n"
+        "1-mock imtihon bepul — qolganlari premium bilan ochiladi.\n\n"
         "Boshlash uchun pastdagi menyudan tanlang 👇\n\n"
         "🏆 Har oy TOP-3 faolga pul bonusi!",
         reply_markup=main_reply_keyboard(paid=paid),
@@ -979,13 +981,17 @@ async def send_mocktests_menu(chat_id, user_id):
     (kept as a fallback/alias) so the menu never drifts out of sync."""
     mocks = db.list_mock_quizzes()
     if not mocks:
-        await bot.send_message(chat_id, "Hozircha testlar mavjud emas. Tez orada qo'shiladi!")
+        await bot.send_message(chat_id, "Hozircha mock imtihonlar mavjud emas. Tez orada qo'shiladi!")
         return
     await bot.send_message(
         chat_id,
-        "🎯 <b>Mock imtihonlar</b>\n\nHar biri 45 ta savol, imtihon rejimida "
-        "(javoblar barcha savollardan keyin, oxirida ko'rsatiladi). Birinchi "
-        "imtihon bepul, qolganlari premium bilan ochiladi 👇",
+        "🎯 <b>Mock imtihonlar</b>\n\n"
+        "Har biri — 45 ta savoldan iborat <b>to'liq imtihon simulyatsiyasi</b>. "
+        "Mavzu tanlash yo'q, yordam yo'q — to'g'ridan-to'g'ri haqiqiy imtihondagidek "
+        "45 ta savolni oxirigacha yechasiz. Javoblar va tahlil faqat imtihon "
+        "tugagach ko'rsatiladi.\n\n"
+        "📊 Oxirida: aniq ball, foiz va taxminiy sertifikat darajangiz (A+/A/B+/B/C+/C).\n\n"
+        "1-imtihon — <b>bepul</b>. Qolgan 9 tasi premium bilan ochiladi 👇",
         reply_markup=mock_exams_keyboard(user_id),
         parse_mode="HTML",
     )
@@ -2385,6 +2391,54 @@ async def cmd_clearquestions(message: Message, command: CommandObject):
         f"🗑️ \"{quiz['title']}\" testidagi {n_before} ta savol o'chirildi.\n"
         f"Endi /bulkadd {quiz_id} orqali fayllarni to'g'ri tartibda qaytadan yuklang."
     )
+
+
+@dp.message(Command("listquestions"))
+async def cmd_listquestions(message: Message, command: CommandObject):
+    """Admin: /listquestions <quiz_id> - shows every question's id and a short
+    preview, so you can find the exact id of a question you want to remove
+    with /deletequestion. Splits into chunks if the list is long (Telegram's
+    4096-char message limit)."""
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    if not command.args or not command.args.strip().isdigit():
+        await message.answer("Foydalanish: /listquestions <test_id>")
+        return
+    quiz_id = int(command.args.strip())
+    quiz = db.get_quiz(quiz_id)
+    if not quiz:
+        await message.answer("Bunday ID li test topilmadi.")
+        return
+    rows = db.list_questions_brief(quiz_id)
+    if not rows:
+        await message.answer(f"\"{quiz['title']}\" testida hozircha savollar yo'q.")
+        return
+    lines = [f"📋 <b>{quiz['title']}</b> — {len(rows)} ta savol\n"]
+    for r in rows:
+        tag = " ✍️" if r["question_type"] == "written" else ""
+        lines.append(f"ID {r['id']}{tag}: {r['preview']}")
+    lines.append(f"\nBirortasini o'chirish: /deletequestion <savol_id>")
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await message.answer(text[i:i + 3500], parse_mode="HTML")
+
+
+@dp.message(Command("deletequestion"))
+async def cmd_deletequestion(message: Message, command: CommandObject):
+    """Admin: /deletequestion <question_id> - removes exactly ONE question,
+    found via /listquestions <quiz_id>. Unlike /clearquestions, this never
+    touches the rest of the quiz's questions."""
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    if not command.args or not command.args.strip().isdigit():
+        await message.answer("Foydalanish: /deletequestion <savol_id>\n\nSavol ID sini /listquestions <test_id> orqali toping.")
+        return
+    question_id = int(command.args.strip())
+    deleted = db.delete_question(question_id)
+    if deleted:
+        await message.answer(f"✅ ID {question_id} li savol o'chirildi.")
+    else:
+        await message.answer(f"Bunday ID li savol topilmadi.")
 
 
 @dp.message(Command("backupdata"))

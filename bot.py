@@ -1197,18 +1197,32 @@ async def send_exam_reminders():
     for the free-preview exam this ALSO revokes that user's free access to
     it specifically (per explicit product decision - the free exam is not
     exempt from the paywall lock)."""
-    for a in db.get_stalled_exam_attempts(config.MOCK_EXAM_REMINDER_HOURS, stage=0):
-        try:
-            await bot.send_message(
-                a["user_id"],
-                f"⏳ \"{a['quiz_title']}\" mock imtihonini yarim yo'lda qoldirdingiz. "
-                f"Davom etish uchun /mocktests bosing!",
-            )
-        except Exception as e:
-            logging.warning(f"Exam reminder failed for {a['user_id']}: {e}")
+       for a in db.get_stalled_exam_attempts(config.MOCK_EXAM_PAYWALL_HOURS, stage=1):
+        db.lock_exam_attempt(a["attempt_id"])
+        if a["is_free_preview"]:
+            # Bepul sinov imtihoni: huquqni olib qo'ymaymiz, faqat urinishni
+            # tugatamiz - foydalanuvchi qaytib kelib qaytadan boshlashi mumkin.
+            try:
+                await bot.send_message(
+                    a["user_id"],
+                    f"⏳ \"{a['quiz_title']}\" bepul sinov imtihoningiz vaqt "
+                    f"tugagani sababli to'xtadi. Xavotir olmang - \"📝 Testlar\" "
+                    f"tugmasidan qaytadan boshlashingiz mumkin!",
+                )
+            except Exception as e:
+                logging.warning(f"Free exam lock notify failed for {a['user_id']}: {e}")
+        else:
+            try:
+                await bot.send_message(
+                    a["user_id"],
+                    f"🔒 \"{a['quiz_title']}\" imtihoningiz vaqt tugagani sababli yopildi. "
+                    f"Qayta boshlash uchun premium kerak bo'ladi.",
+                )
+            except Exception as e:
+                logging.warning(f"Exam lock notify failed for {a['user_id']}: {e}")
         db.mark_exam_reminder_sent(a["attempt_id"], stage=1)
 
-    for a in db.get_stalled_exam_attempts(config.MOCK_EXAM_PAYWALL_HOURS, stage=1):
+ (config.MOCK_EXAM_PAYWALL_HOURS, stage=1):
         db.lock_exam_attempt(a["attempt_id"])
         if a["is_free_preview"]:
             db.lock_free_preview_access(a["user_id"], a["quiz_id"])
@@ -1241,12 +1255,12 @@ class ActivityMiddleware:
 
 dp.update.outer_middleware(ActivityMiddleware())
 
-
 class SubscriptionMiddleware:
     """Blocks every handler for a user who hasn't joined config.REQUIRED_CHANNEL_ID,
     showing a subscribe prompt instead. The admin (config.ADMIN_ID) is always
     exempt, and the "✅ Tekshirish" callback itself is always let through so a
-    non-subscribed user can actually press it to re-check."""
+    non-subscribed user can actually press it to re-check.
+    """
 
     async def __call__(self, handler, event: TelegramObject, data: dict):
         if not config.REQUIRED_CHANNEL_ID:

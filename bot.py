@@ -1034,22 +1034,31 @@ async def on_mock_start(callback: CallbackQuery, state: FSMContext):
     await send_exam_question(callback.message.chat.id, quiz_id, attempt_id, state)
     await callback.answer()
 
+EXAM_DURATION_MINUTES = 90
 
 async def send_exam_question(chat_id, quiz_id, attempt_id, state: FSMContext):
     with db.get_db() as conn:
         attempt = conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
     if attempt is None:
         return
+
+    started_at = datetime.datetime.fromisoformat(attempt["started_at"])
+    elapsed_min = (datetime.datetime.utcnow() - started_at).total_seconds() / 60
+    remaining = EXAM_DURATION_MINUTES - elapsed_min
+    if remaining <= 0:
+        await finish_exam(chat_id, quiz_id, attempt_id)
+        return
+
     questions = db.get_questions(quiz_id)
     idx = attempt["current_index"]
-
     if idx >= len(questions):
         await finish_exam(chat_id, quiz_id, attempt_id)
         return
 
     db.touch_attempt_activity(attempt_id)
     q = questions[idx]
-    header = f"Savol {idx + 1}/{len(questions)}:\n\n{q['question_text']}"
+    header = f"⏱ Qolgan vaqt: {int(remaining)} daqiqa\n\nSavol {idx + 1}/{len(questions)}:\n\n{q['question_text']}"
+    # ...rest stays the same, just use `header` instead of the old header
 
     if q.get("question_type") == "written":
         await state.set_state(ExamAnswer.waiting_written)

@@ -103,16 +103,31 @@ AI_MODEL = os.getenv("AI_MODEL", "gemini-3.6-flash")
 # once they hit it). Paid/premium users are always unlimited. Change this
 # anytime on Railway without a redeploy.
 AI_DAILY_LIMIT = int(os.getenv("AI_DAILY_LIMIT", "5"))
+
 # --- Mock exams ---
+# Target question count per mock exam (informational only - not enforced in
+# code; just upload however many questions you actually have via /bulkadd).
 MOCK_TOTAL_QUESTIONS = 45
+
+# Hours of inactivity mid-exam before the user gets a "come back and finish"
+# reminder (stage 0 -> 1).
 MOCK_EXAM_REMINDER_HOURS = int(os.getenv("MOCK_EXAM_REMINDER_HOURS", "6"))
-# After this many hours with no reminder response, an unfinished PAID mock
-# exam locks and requires payment to resume (the free preview exam never locks).
+
+# Hours of inactivity mid-exam (from the SAME reminder point, stage 1) before
+# the attempt is locked and requires premium to resume/restart. This applies
+# to the free-preview exam too, by explicit product decision - it is not
+# exempt from the paywall lock.
 MOCK_EXAM_PAYWALL_HOURS = int(os.getenv("MOCK_EXAM_PAYWALL_HOURS", "24"))
 
 # Real Milliy Sertifikat grading bands (Rash-model official cutoffs, applied
 # here as a straight percentage approximation since we can't reproduce the
-# actual Rash model without the official item bank).
+# actual Rash model without the official item bank). Ordered highest cutoff
+# first - compute_grade() in database.py walks this list top-down.
 GRADE_BANDS = [
-    (70, "A+"), (65, "A"), (60, "B+"), (55, "B"), (50, "C+"), (46, "C"),
+    (70, "A+"),
+    (65, "A"),
+    (60, "B+"),
+    (55, "B"),
+    (50, "C+"),
+    (46, "C"),
 ]
